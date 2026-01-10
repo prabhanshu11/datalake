@@ -10,6 +10,79 @@ A personal data lake for managing audio recordings, transcripts, and screenshots
 - **Full-Text Search**: Search transcripts using SQLite FTS5
 - **Comprehensive Logging**: Structured logging with timestamps for all operations
 - **Tested**: 35+ comprehensive tests ensuring reliability
+- **Containerized**: Docker support with isolated environment variables
+
+## Quick Start (Docker - Recommended)
+
+The easiest way to run datalake is using Docker, which provides isolated environment variables and consistent behavior across systems.
+
+### Prerequisites
+- Docker
+- Docker Compose
+
+### Setup
+
+1. **Build the container:**
+```bash
+docker-compose build
+```
+
+2. **Initialize the database:**
+```bash
+./docker-init.sh
+```
+
+3. **Ingest audio files:**
+```bash
+./docker-ingest.sh path/to/audio.wav "meeting,important"
+```
+
+4. **Query data:**
+```bash
+./docker-query.sh
+```
+
+5. **Run tests:**
+```bash
+./docker-test.sh
+```
+
+### Docker Helper Scripts
+
+- **`docker-init.sh`** - Initialize database and directory structure
+- **`docker-ingest.sh <file> [tags]`** - Ingest audio files into the datalake
+- **`docker-query.sh`** - Open interactive query interface
+- **`docker-test.sh [args]`** - Run pytest tests in container
+
+### Docker Environment Variables
+
+The container uses isolated environment variables (defined in `Dockerfile` and `docker-compose.yml`):
+
+```yaml
+DATA_DIR=/data              # Persistent data storage (Docker volume)
+DB_FILE=/data/datalake.db   # SQLite database location
+LOG_DIR=/app/logs           # Log files (Docker volume)
+PROJECT_ROOT=/app           # Application root
+SCHEMA_FILE=/app/schema.sql # Database schema
+```
+
+### Docker Volumes
+
+Three persistent volumes are created:
+- **`datalake-data`** - Audio, transcripts, screenshots, and database
+- **`datalake-logs`** - Application logs
+- **`datalake-db`** - Reserved for future use
+
+To inspect volumes:
+```bash
+docker volume ls | grep datalake
+docker volume inspect datalake-data
+```
+
+To backup data:
+```bash
+docker run --rm -v datalake-data:/data -v $(pwd):/backup alpine tar czf /backup/datalake-backup.tar.gz /data
+```
 
 ## Directory Structure
 
@@ -290,33 +363,17 @@ export DATA_DIR=/mnt/data-ssd/datalake
 
 ## Future Enhancements
 
+- [x] **Docker Container**: Containerized deployment with isolated environment ✅
 - [ ] **Vector Search**: Add `sqlite-vss` extension for semantic search
 - [ ] **REST API**: FastAPI/Flask wrapper for HTTP access
 - [ ] **Web UI**: Simple dashboard for browsing and searching
-- [ ] **Screenshot Ingestion**: Script for screenshot ingestion
-- [ ] **Transcript Ingestion**: Script for transcript ingestion
-- [ ] **Automatic Cleanup**: Script for managing old files
-- [ ] **Backup/Restore**: Automated backup scripts
+- [ ] **Screenshot Ingestion**: Script for screenshot ingestion with metadata
+- [ ] **Transcript Ingestion**: Script for transcript ingestion with word count
+- [ ] **Automatic Cleanup**: Script for managing old files and log rotation
+- [ ] **Backup/Restore**: Automated backup scripts with compression
 - [ ] **Loki Integration**: Centralized logging with Grafana Loki
-- [ ] **Docker Container**: Containerized deployment with isolated environment
-
-## Containerization (Planned)
-
-To isolate environment variables and improve deployment:
-
-```yaml
-# docker-compose.yml (planned)
-version: '3.8'
-services:
-  datalake:
-    build: .
-    environment:
-      - DATA_DIR=/data
-      - DB_FILE=/app/datalake.db
-    volumes:
-      - ./data:/data
-      - ./logs:/app/logs
-```
+- [ ] **S3 Backend**: Optional S3-compatible storage backend
+- [ ] **Encryption**: At-rest encryption for sensitive recordings
 
 ## Contributing
 

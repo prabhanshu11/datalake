@@ -1,0 +1,52 @@
+services:
+  datalake:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: datalake:latest
+    container_name: datalake
+
+    # Environment variables (isolated per container)
+    environment:
+      - DATA_DIR=/data
+      - DB_FILE=/data/datalake.db
+      - LOG_DIR=/app/logs
+      - PROJECT_ROOT=/app
+      - SCHEMA_FILE=/app/schema.sql
+
+    # Volume mounts
+    volumes:
+      # Persistent data storage
+      - datalake-data:/data
+      # Logs
+      - datalake-logs:/app/logs
+      # Database (optional: can also be in /data)
+      - datalake-db:/app/db
+
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+
+    # Default command: run tests
+    command: ["/usr/local/bin/uv", "run", "pytest", "-v"]
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Resource limits (optional)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  datalake-data:
+    driver: local
+  datalake-logs:
+    driver: local
+  datalake-db:
+    driver: local

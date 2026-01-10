@@ -1,7 +1,40 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Database and data
 *.db
+*.db-journal
+*.sqlite
+*.sqlite3
 data/
 logs/
+
+# Testing
 .pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
