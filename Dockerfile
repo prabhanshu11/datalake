@@ -31,6 +31,7 @@ RUN /usr/local/bin/uv sync --frozen
 COPY --chown=datalake:datalake schema.sql main.py README.md ./
 COPY --chown=datalake:datalake scripts/ ./scripts/
 COPY --chown=datalake:datalake tests/ ./tests/
+COPY --chown=datalake:datalake api/ ./api/
 
 # Make scripts executable
 RUN chmod +x ./scripts/*.sh
@@ -52,9 +53,12 @@ ENV DATA_DIR=/data \
 # Expose volume mount points
 VOLUME ["/data", "/app/logs"]
 
-# Health check - verify database is accessible
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD [ -f "${DB_FILE}" ] && sqlite3 "${DB_FILE}" "SELECT 1;" > /dev/null || exit 1
+# Expose API port
+EXPOSE 8766
 
-# Default command - run tests
-CMD ["/usr/local/bin/uv", "run", "pytest", "-v"]
+# Health check - verify API is accessible
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8766/health || exit 1
+
+# Default command - run API server
+CMD ["/usr/local/bin/uv", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8766"]

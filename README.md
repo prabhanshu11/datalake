@@ -14,7 +14,28 @@ A personal data lake for managing audio recordings, transcripts, and screenshots
 
 ## Quick Start (Docker - Recommended)
 
-The easiest way to run datalake is using Docker, which provides isolated environment variables and consistent behavior across systems.
+The datalake runs as a Docker container with both a REST API (for network access) and CLI tools.
+
+### Automated Setup (via local-bootstrapping)
+
+**On Laptop (where database runs):**
+```bash
+cd ~/Programs/local-bootstrapping
+./scripts/setup-datalake.sh
+```
+
+This will:
+- Set up the Datalake API service on port **8766**
+- Configure auto-start on login
+- Enable self-healing (restarts if crashes)
+- Run health checks every 5 minutes
+
+The API will be available at:
+- **Local**: `http://localhost:8766`
+- **Network**: `http://192.168.29.137:8766` (or your laptop IP)
+- **Tailscale**: `http://100.103.8.87:8766`
+
+### Manual Setup
 
 ### Prerequisites
 - Docker
@@ -32,17 +53,30 @@ docker-compose build
 ./docker-init.sh
 ```
 
-3. **Ingest audio files:**
+3. **Start the API server:**
+```bash
+docker-compose up -d
+```
+
+The API will be running on port **8766**.
+
+4. **Ingest audio files:**
 ```bash
 ./docker-ingest.sh path/to/audio.wav "meeting,important"
 ```
 
-4. **Query data:**
+5. **Query data (CLI):**
 ```bash
 ./docker-query.sh
 ```
 
-5. **Run tests:**
+6. **Query data (API):**
+```bash
+curl http://localhost:8766/api/v1/audio
+curl http://localhost:8766/api/v1/stats
+```
+
+7. **Run tests:**
 ```bash
 ./docker-test.sh
 ```
@@ -188,7 +222,111 @@ Optimized indexes for common queries:
 - `idx_screenshots_created_at`: Fast queries by date
 - `idx_screenshots_tags`: Fast tag filtering
 
-## Getting Started
+## REST API Access
+
+The datalake runs a FastAPI server on port **8766** providing network access to the database.
+
+### API Endpoints
+
+**Base URL**: `http://localhost:8766` (or laptop IP for network access)
+
+**Interactive Documentation:**
+- Swagger UI: `http://localhost:8766/docs`
+- ReDoc: `http://localhost:8766/redoc`
+
+**Core Endpoints:**
+```bash
+# Health check
+GET /health
+
+# List audio files (with pagination and filtering)
+GET /api/v1/audio?limit=10&offset=0&tags=meeting
+
+# Get specific audio file
+GET /api/v1/audio/{id}
+
+# List transcripts
+GET /api/v1/transcripts?limit=10&offset=0
+
+# Get specific transcript
+GET /api/v1/transcripts/{id}
+
+# Search transcripts (FTS5 full-text search)
+GET /api/v1/search/transcripts?q=search_term&limit=10
+
+# Get database statistics
+GET /api/v1/stats
+
+# List screenshots
+GET /api/v1/screenshots?limit=10&offset=0
+```
+
+**Example Usage:**
+```bash
+# From desktop, access laptop database
+curl http://100.103.8.87:8766/api/v1/audio | jq
+
+# Search transcripts
+curl "http://100.103.8.87:8766/api/v1/search/transcripts?q=meeting" | jq
+
+# Get stats
+curl http://100.103.8.87:8766/api/v1/stats | jq
+```
+
+### Network Access
+
+**From Desktop to Laptop:**
+- **Tailscale**: `http://100.103.8.87:8766`
+- **Local Network**: `http://192.168.29.137:8766` (find IP with `ip addr`)
+
+**CORS**: Enabled for all origins (suitable for local network use)
+
+### Managing the Service
+
+**If set up via local-bootstrapping (auto-start enabled):**
+```bash
+# Check status
+systemctl --user status datalake.service
+
+# Restart service
+systemctl --user restart datalake.service
+
+# Stop service
+systemctl --user stop datalake.service
+
+# Start service
+systemctl --user start datalake.service
+
+# View service logs
+systemctl --user logs -f datalake.service
+
+# View container logs
+cd ~/Programs/datalake
+docker-compose logs -f
+
+# Disable auto-start
+systemctl --user disable datalake.service
+```
+
+**Manual Docker management:**
+```bash
+# Start server
+docker-compose up -d
+
+# Stop server
+docker-compose down
+
+# Restart server
+docker-compose restart
+
+# View logs
+docker-compose logs -f
+
+# Rebuild and restart
+docker-compose build && docker-compose up -d
+```
+
+## Getting Started (CLI Tools)
 
 ### Prerequisites
 

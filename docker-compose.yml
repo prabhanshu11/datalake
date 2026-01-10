@@ -23,12 +23,16 @@ services:
       # Database (optional: can also be in /data)
       - datalake-db:/app/db
 
+    # Expose API port
+    ports:
+      - "8766:8766"
+
     # Keep container running for interactive use
     stdin_open: true
     tty: true
 
-    # Default command: run tests
-    command: ["/usr/local/bin/uv", "run", "pytest", "-v"]
+    # Default command: run API server
+    command: ["/usr/local/bin/uv", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8766"]
 
     # Restart policy
     restart: unless-stopped
