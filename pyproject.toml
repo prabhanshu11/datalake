@@ -10,10 +10,8 @@ dependencies = [
 [project.scripts]
 claude-parser = "parsers.claude_parser:main"
 voice-parser = "parsers.voice_parser:main"
+chatgpt-parser = "parsers.chatgpt_parser:main"
 datalake-web = "web.app:main"
-
-[project.scripts]
-claude-parser = "parsers.claude_parser:main"
 
 [dependency-groups]
 dev = [
