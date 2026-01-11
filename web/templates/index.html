@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}Datalake - Home{% endblock %}
+
+{% block content %}
+<h1>Datalake Overview</h1>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="number">{{ stats.sessions }}</div>
+        <div class="label">Claude Sessions</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.messages }}</div>
+        <div class="label">Messages</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.history }}</div>
+        <div class="label">History Entries</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.voice_sessions }}</div>
+        <div class="label">Voice Sessions</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.audio_files }}</div>
+        <div class="label">Audio Files</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ stats.transcripts }}</div>
+        <div class="label">Transcripts</div>
+    </div>
+</div>
+
+<h2>Recent Sessions</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Session</th>
+            <th>Summary</th>
+            <th>Messages</th>
+            <th>Tokens</th>
+            <th>Device</th>
+            <th>Started</th>
+            <th>Rating</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in recent %}
+        <tr>
+            <td><a href="/session/{{ s.session_id }}">{{ s.session_id[:8] }}...</a></td>
+            <td class="truncate">{{ s.summary or 'No summary' }}</td>
+            <td>{{ s.total_messages }}</td>
+            <td>{{ "{:,}".format(s.total_tokens or 0) }}</td>
+            <td>{{ s.source_device }}</td>
+            <td>{{ s.started_at[:16] if s.started_at else '-' }}</td>
+            <td>{{ s.rating or '-' }}/10</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

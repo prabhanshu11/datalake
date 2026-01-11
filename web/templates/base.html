@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Datalake{% endblock %}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            line-height: 1.5;
+        }
+        nav {
+            background: #161b22;
+            padding: 1rem 2rem;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+        }
+        nav a {
+            color: #58a6ff;
+            text-decoration: none;
+        }
+        nav a:hover { text-decoration: underline; }
+        nav .brand { font-weight: bold; font-size: 1.2rem; color: #c9d1d9; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+        h1, h2 { margin-bottom: 1rem; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 1rem;
+            text-align: center;
+        }
+        .stat-card .number { font-size: 2rem; font-weight: bold; color: #58a6ff; }
+        .stat-card .label { font-size: 0.85rem; color: #8b949e; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #161b22;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid #30363d;
+        }
+        th { background: #21262d; font-weight: 600; }
+        tr:hover { background: #21262d; }
+        a { color: #58a6ff; }
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge-user { background: #238636; }
+        .badge-assistant { background: #1f6feb; }
+        .badge-success { background: #238636; }
+        .badge-failed { background: #da3633; }
+        .message-box {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 1rem;
+            margin: 0.5rem 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .thinking {
+            background: #1c1f26;
+            border-left: 3px solid #f0883e;
+            font-size: 0.9rem;
+            color: #8b949e;
+        }
+        .thinking-toggle {
+            cursor: pointer;
+            color: #f0883e;
+            font-size: 0.85rem;
+        }
+        .copy-btn {
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            padding: 0.3rem 0.6rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+        .copy-btn:hover { background: #30363d; }
+        .search-box {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        .search-box input {
+            flex: 1;
+            padding: 0.75rem;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #c9d1d9;
+            font-size: 1rem;
+        }
+        .search-box button {
+            padding: 0.75rem 1.5rem;
+            background: #238636;
+            border: none;
+            border-radius: 6px;
+            color: white;
+            cursor: pointer;
+        }
+        .pagination {
+            display: flex;
+            gap: 0.5rem;
+            justify-content: center;
+            margin-top: 2rem;
+        }
+        .pagination a {
+            padding: 0.5rem 1rem;
+            background: #21262d;
+            border-radius: 4px;
+            text-decoration: none;
+        }
+        .pagination a:hover { background: #30363d; }
+        .rating {
+            display: inline-flex;
+            gap: 0.2rem;
+        }
+        .rating span {
+            cursor: pointer;
+            color: #30363d;
+        }
+        .rating span.active { color: #f0883e; }
+        .truncate {
+            max-width: 300px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <span class="brand">Datalake</span>
+        <a href="/">Home</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/voice">Voice</a>
+        <a href="/search">Search</a>
+    </nav>
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    <script>
+        function copyText(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                alert('Copied!');
+            });
+        }
+        function toggleThinking(id) {
+            const el = document.getElementById('thinking-' + id);
+            el.style.display = el.style.display === 'none' ? 'block' : 'none';
+        }
+        function rate(type, id, rating) {
+            fetch(`/api/rate/${type}/${id}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({rating: rating})
+            }).then(r => r.json()).then(data => {
+                if (data.success) location.reload();
+            });
+        }
+    </script>
+</body>
+</html>

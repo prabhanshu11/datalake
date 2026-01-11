@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+
+{% block title %}Voice Sessions - Datalake{% endblock %}
+
+{% block content %}
+<style>
+    .voice-card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+        overflow: hidden;
+    }
+    .voice-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 1rem;
+        background: #21262d;
+        border-bottom: 1px solid #30363d;
+    }
+    .voice-header-left {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+    .voice-content {
+        padding: 1rem;
+    }
+    .transcript-box {
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 1rem;
+        margin-top: 1rem;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+    .audio-player {
+        width: 100%;
+        max-width: 400px;
+    }
+    .feedback-form {
+        margin-top: 1rem;
+        padding-top: 1rem;
+        border-top: 1px solid #30363d;
+    }
+    .feedback-form textarea {
+        width: 100%;
+        min-height: 100px;
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 0.75rem;
+        color: #c9d1d9;
+        font-family: inherit;
+        resize: vertical;
+    }
+    .feedback-form button {
+        margin-top: 0.5rem;
+        padding: 0.5rem 1rem;
+        background: #238636;
+        border: none;
+        border-radius: 6px;
+        color: white;
+        cursor: pointer;
+    }
+    .feedback-form button:hover { background: #2ea043; }
+    .rating-inline {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .star {
+        cursor: pointer;
+        font-size: 1rem;
+        color: #30363d;
+    }
+    .star:hover, .star.active { color: #f0883e; }
+    .meta-info {
+        font-size: 0.85rem;
+        color: #8b949e;
+    }
+</style>
+
+<h1>Voice Sessions ({{ total }})</h1>
+
+<p style="color: #8b949e; margin-bottom: 2rem;">
+    Voice recordings from omarchy-voice-typing with linked transcripts
+</p>
+
+{% for s in sessions %}
+<div class="voice-card">
+    <div class="voice-header">
+        <div class="voice-header-left">
+            <span class="badge {% if s.success %}badge-success{% else %}badge-failed{% endif %}">
+                {{ 'Success' if s.success else 'Failed' }}
+            </span>
+            <span class="meta-info">{{ s.created_at[:16] if s.created_at else '-' }}</span>
+            {% if s.duration_seconds %}
+            <span class="meta-info">{{ "{:.1f}".format(s.duration_seconds) }}s</span>
+            {% endif %}
+            {% if s.word_count %}
+            <span class="meta-info">{{ s.word_count }} words</span>
+            {% endif %}
+        </div>
+        <div class="rating-inline" data-id="{{ s.id }}">
+            {% for i in range(1, 11) %}
+            <span class="star {% if s.rating and i <= s.rating %}active{% endif %}"
+                  onclick="rate('voice', {{ s.id }}, {{ i }})">★</span>
+            {% endfor %}
+            <span class="meta-info">{{ s.rating or '-' }}/10</span>
+        </div>
+    </div>
+
+    <div class="voice-content">
+        {% if s.audio_filename %}
+        <div>
+            <strong>Audio:</strong> <span class="meta-info">{{ s.audio_filename }}</span>
+            <audio controls class="audio-player" style="margin-top: 0.5rem;">
+                <source src="/audio/{{ s.audio_filename }}" type="audio/webm">
+                Your browser does not support audio playback.
+            </audio>
+        </div>
+        {% else %}
+        <p class="meta-info">(No audio file linked)</p>
+        {% endif %}
+
+        {% if s.transcript %}
+        <div class="transcript-box">
+            <strong style="color: #58a6ff;">Transcript:</strong><br>
+            {{ s.transcript }}
+        </div>
+        {% else %}
+        <p class="meta-info" style="margin-top: 1rem;">(No transcript)</p>
+        {% endif %}
+
+        <div class="feedback-form">
+            <label style="display: block; margin-bottom: 0.5rem;">
+                <strong>Correction / Feedback:</strong>
+                <span class="meta-info">(edit if transcription was wrong)</span>
+            </label>
+            <textarea id="feedback-{{ s.id }}" placeholder="Enter corrected transcript...">{{ s.corrected_transcript or '' }}</textarea>
+            <button onclick="submitFeedback({{ s.id }})">Save Correction</button>
+        </div>
+    </div>
+</div>
+{% endfor %}
+
+{% if not sessions %}
+<p class="meta-info">No voice sessions found.</p>
+{% endif %}
+
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="?page={{ page - 1 }}">&laquo; Prev</a>
+    {% endif %}
+    <span>Page {{ page }} of {{ (total // per_page) + 1 }}</span>
+    {% if page * per_page < total %}
+    <a href="?page={{ page + 1 }}">Next &raquo;</a>
+    {% endif %}
+</div>
+
+<script>
+    function submitFeedback(voiceId) {
+        const textarea = document.getElementById('feedback-' + voiceId);
+        fetch('/api/feedback/' + voiceId, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({corrected_transcript: textarea.value})
+        }).then(r => r.json()).then(data => {
+            if (data.success) {
+                alert('Feedback saved!');
+            }
+        });
+    }
+</script>
+{% endblock %}

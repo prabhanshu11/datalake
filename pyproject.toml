@@ -3,7 +3,14 @@ name = "datalake"
 version = "2.0.0"
 description = "Personal data lake for Claude Code conversations, voice typing, and email"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "flask>=3.0.0",
+]
+
+[project.scripts]
+claude-parser = "parsers.claude_parser:main"
+voice-parser = "parsers.voice_parser:main"
+datalake-web = "web.app:main"
 
 [project.scripts]
 claude-parser = "parsers.claude_parser:main"

@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Sessions - Datalake{% endblock %}
+
+{% block content %}
+<h1>Claude Sessions ({{ total }})</h1>
+
+<table>
+    <thead>
+        <tr>
+            <th>Session</th>
+            <th>Summary</th>
+            <th>Project</th>
+            <th>Messages</th>
+            <th>Tokens</th>
+            <th>Duration</th>
+            <th>Device</th>
+            <th>Started</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in sessions %}
+        <tr>
+            <td><a href="/session/{{ s.session_id }}">{{ s.session_id[:8] }}...</a></td>
+            <td class="truncate">{{ s.summary or '-' }}</td>
+            <td class="truncate">{{ s.project_path }}</td>
+            <td>{{ s.total_messages }}</td>
+            <td>{{ "{:,}".format(s.total_tokens or 0) }}</td>
+            <td>{{ "{:.0f}m".format((s.duration_seconds or 0) / 60) }}</td>
+            <td>{{ s.source_device }}</td>
+            <td>{{ s.started_at[:16] if s.started_at else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="?page={{ page - 1 }}">&laquo; Prev</a>
+    {% endif %}
+    <span>Page {{ page }} of {{ (total // per_page) + 1 }}</span>
+    {% if page * per_page < total %}
+    <a href="?page={{ page + 1 }}">Next &raquo;</a>
+    {% endif %}
+</div>
+{% endblock %}
