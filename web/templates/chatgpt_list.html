@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+
+{% block title %}ChatGPT Conversations - Datalake{% endblock %}
+
+{% block content %}
+<style>
+    .import-banner {
+        background: #1c2128;
+        border: 2px dashed #30363d;
+        border-radius: 8px;
+        padding: 2rem;
+        margin-bottom: 2rem;
+        text-align: center;
+    }
+    .import-banner h3 {
+        margin-bottom: 1rem;
+        color: #58a6ff;
+    }
+    .file-drop-zone {
+        border: 2px dashed #58a6ff;
+        border-radius: 6px;
+        padding: 3rem;
+        margin: 1rem 0;
+        cursor: pointer;
+        transition: all 0.3s;
+    }
+    .file-drop-zone:hover {
+        background: #161b22;
+        border-color: #79c0ff;
+    }
+    .file-drop-zone.dragover {
+        background: #1c2128;
+        border-color: #79c0ff;
+    }
+    .upload-btn {
+        background: #238636;
+        color: white;
+        border: none;
+        padding: 0.75rem 1.5rem;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 1rem;
+    }
+    .upload-btn:hover { background: #2ea043; }
+    .import-result {
+        margin-top: 1rem;
+        padding: 1rem;
+        border-radius: 6px;
+    }
+    .import-result.success {
+        background: #1a3a2a;
+        border: 1px solid #238636;
+    }
+    .import-result.error {
+        background: #3a1a1a;
+        border: 1px solid #da3633;
+    }
+</style>
+
+<h1>ChatGPT Conversations</h1>
+
+{% if imports and imports['count'] > 0 %}
+<div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 2rem;">
+    <div class="stat-card">
+        <div class="number">{{ imports['count'] }}</div>
+        <div class="label">Imports</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ total }}</div>
+        <div class="label">Conversations</div>
+    </div>
+    <div class="stat-card">
+        <div class="number">{{ imports['total_msgs'] or 0 }}</div>
+        <div class="label">Messages</div>
+    </div>
+</div>
+{% endif %}
+
+<div class="import-banner">
+    <h3>📦 Import ChatGPT Conversations</h3>
+    <p style="margin-bottom: 1rem; color: #8b949e;">
+        Export from ChatGPT → Settings → Data Controls → Export data
+    </p>
+    <div class="file-drop-zone" id="dropZone">
+        <p style="font-size: 1.1rem; margin-bottom: 0.5rem;">Drop ZIP file here</p>
+        <p style="color: #8b949e;">or click to browse</p>
+        <input type="file" id="fileInput" accept=".zip" style="display: none;">
+    </div>
+    <div id="importResult" class="import-result" style="display: none;"></div>
+</div>
+
+<h2>Conversations ({{ total }})</h2>
+
+{% if conversations %}
+<table>
+    <thead>
+        <tr>
+            <th>Title</th>
+            <th>Model</th>
+            <th>Messages</th>
+            <th>Updated</th>
+            <th>Rating</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for conv in conversations %}
+        <tr>
+            <td>
+                <a href="/chatgpt/{{ conv.conversation_id }}">{{ conv.title or 'Untitled' }}</a>
+                {% if conv.is_starred %}⭐{% endif %}
+            </td>
+            <td>{{ conv.model_slug or '-' }}</td>
+            <td>{{ conv.message_count }}</td>
+            <td>{{ conv.update_time|int if conv.update_time else 0 }}</td>
+            <td>{{ conv.rating if conv.rating else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<div class="pagination" style="margin-top: 1rem;">
+    {% if page > 1 %}
+    <a href="?page={{ page - 1 }}">← Previous</a>
+    {% endif %}
+    <span>Page {{ page }}</span>
+    {% if conversations|length == per_page %}
+    <a href="?page={{ page + 1 }}">Next →</a>
+    {% endif %}
+</div>
+{% else %}
+<p style="color: #8b949e;">No conversations yet. Import a ChatGPT export above.</p>
+{% endif %}
+
+<script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const importResult = document.getElementById('importResult');
+
+// Click to browse
+dropZone.addEventListener('click', () => fileInput.click());
+
+// Drag and drop
+dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('dragover');
+});
+
+dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('dragover');
+});
+
+dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+        uploadFile(files[0]);
+    }
+});
+
+// File input change
+fileInput.addEventListener('change', (e) => {
+    if (e.target.files.length > 0) {
+        uploadFile(e.target.files[0]);
+    }
+});
+
+function uploadFile(file) {
+    if (!file.name.endsWith('.zip')) {
+        showResult('error', 'File must be a ZIP archive');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    importResult.style.display = 'block';
+    importResult.className = 'import-result';
+    importResult.textContent = 'Uploading and importing... This may take a minute.';
+
+    fetch('/api/import/chatgpt', {
+        method: 'POST',
+        body: formData
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            showResult('success',
+                `✓ Import complete!\n` +
+                `New: ${data.conversations_new}, Updated: ${data.conversations_updated}\n` +
+                `Messages: ${data.messages_imported}`
+            );
+            setTimeout(() => location.reload(), 2000);
+        } else {
+            showResult('error', `Error: ${data.error}`);
+        }
+    })
+    .catch(err => {
+        showResult('error', `Upload failed: ${err.message}`);
+    });
+}
+
+function showResult(type, message) {
+    importResult.style.display = 'block';
+    importResult.className = `import-result ${type}`;
+    importResult.textContent = message;
+}
+</script>
+{% endblock %}

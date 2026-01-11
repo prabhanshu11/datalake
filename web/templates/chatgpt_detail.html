@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+
+{% block title %}{{ conversation.title or 'Untitled' }} - ChatGPT - Datalake{% endblock %}
+
+{% block content %}
+<style>
+    .conv-header {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 1.5rem;
+        margin-bottom: 2rem;
+    }
+    .conv-meta {
+        display: flex;
+        gap: 2rem;
+        flex-wrap: wrap;
+        color: #8b949e;
+        font-size: 0.9rem;
+        margin-top: 0.5rem;
+    }
+    .messages-timeline {
+        position: relative;
+        padding-left: 2rem;
+    }
+    .messages-timeline::before {
+        content: '';
+        position: absolute;
+        left: 0.5rem;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        background: #30363d;
+    }
+    .message-card {
+        position: relative;
+        margin-bottom: 1.5rem;
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+    .message-card::before {
+        content: '';
+        position: absolute;
+        left: -1.5rem;
+        top: 1.5rem;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #30363d;
+    }
+    .message-card.user::before { background: #238636; }
+    .message-card.assistant::before { background: #1f6feb; }
+    .message-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.75rem 1rem;
+        background: #21262d;
+        border-bottom: 1px solid #30363d;
+    }
+    .message-content {
+        padding: 1rem;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        max-height: 600px;
+        overflow-y: auto;
+    }
+    .badge {
+        display: inline-block;
+        padding: 0.25rem 0.5rem;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+    .badge-user { background: #238636; color: white; }
+    .badge-assistant { background: #1f6feb; color: white; }
+    .badge-tool { background: #a371f7; color: white; }
+    .copy-btn {
+        background: #21262d;
+        border: 1px solid #30363d;
+        color: #58a6ff;
+        padding: 0.25rem 0.75rem;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.85rem;
+    }
+    .copy-btn:hover { background: #30363d; }
+    .rating-widget {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 1rem;
+    }
+    .rating-stars {
+        display: flex;
+        gap: 0.2rem;
+    }
+    .star {
+        cursor: pointer;
+        font-size: 1.2rem;
+        color: #30363d;
+        transition: color 0.2s;
+    }
+    .star:hover, .star.active { color: #f0883e; }
+    .back-link { margin-bottom: 1rem; display: inline-block; }
+</style>
+
+<a href="/chatgpt" class="back-link">&larr; Back to ChatGPT</a>
+
+<div class="conv-header">
+    <h1>{{ conversation.title or 'Untitled Conversation' }}</h1>
+    <div class="conv-meta">
+        <span><strong>Model:</strong> {{ conversation.model_slug or 'Unknown' }}</span>
+        <span><strong>Messages:</strong> {{ conversation.message_count }}</span>
+        {% if conversation.create_time %}
+        <span><strong>Created:</strong> {{ conversation.create_time|int }}</span>
+        {% endif %}
+        {% if conversation.update_time %}
+        <span><strong>Updated:</strong> {{ conversation.update_time|int }}</span>
+        {% endif %}
+    </div>
+
+    <div class="rating-widget">
+        <span>Rate this conversation:</span>
+        <div class="rating-stars" data-type="chatgpt" data-id="{{ conversation.id }}" data-rating="{{ conversation.rating or 0 }}">
+            {% for i in range(1, 11) %}
+            <span class="star {% if conversation.rating and i <= conversation.rating %}active{% endif %}"
+                  onclick="rate('chatgpt', {{ conversation.id }}, {{ i }})">★</span>
+            {% endfor %}
+        </div>
+        <span style="color: #8b949e; font-size: 0.85rem;">{{ conversation.rating or '-' }}/10</span>
+    </div>
+</div>
+
+<h2>Messages ({{ messages|length }})</h2>
+
+<div class="messages-timeline">
+    {% for msg in messages %}
+    <div class="message-card {{ msg.role }}">
+        <div class="message-header">
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+                <span class="badge badge-{{ msg.role }}">{{ msg.role }}</span>
+                {% if msg.model_slug %}
+                <span style="color: #8b949e; font-size: 0.8rem;">{{ msg.model_slug }}</span>
+                {% endif %}
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <button class="copy-btn" onclick="copyText(document.getElementById('msg-{{ loop.index }}').innerText)">
+                    Copy
+                </button>
+                {% if msg.create_time %}
+                <span style="color: #8b949e; font-size: 0.85rem;">{{ msg.create_time|int }}</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="message-content" id="msg-{{ loop.index }}">{{ msg.content_text or '(no content)' }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+<script>
+// Add rating API support for ChatGPT conversations
+function rate(type, id, rating) {
+    fetch(`/api/rate/${type}/${id}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({rating: rating})
+    }).then(r => r.json()).then(data => {
+        if (data.success) location.reload();
+    });
+}
+</script>
+{% endblock %}

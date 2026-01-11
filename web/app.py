@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import send_from_directory
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB for ChatGPT zips
 
 # Audio directories to search for files
 AUDIO_DIRS = [
@@ -252,6 +253,7 @@ def rate_item(item_type, item_id):
         'session': 'claude_sessions',
         'message': 'claude_messages',
         'voice': 'voice_sessions',
+        'chatgpt': 'chatgpt_conversations',
     }
 
     if item_type not in table_map:
@@ -304,6 +306,136 @@ def api_stats():
     return jsonify({
         'daily_usage': [dict(row) for row in usage]
     })
+
+
+@app.route('/chatgpt')
+def chatgpt_conversations():
+    """Browse ChatGPT conversations."""
+    db = get_db()
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    offset = (page - 1) * per_page
+
+    total = db.execute('SELECT COUNT(*) FROM chatgpt_conversations').fetchone()[0]
+
+    conversations = db.execute('''
+        SELECT id, conversation_id, title, create_time, update_time,
+               model_slug, message_count, is_starred, rating
+        FROM chatgpt_conversations
+        ORDER BY update_time DESC
+        LIMIT ? OFFSET ?
+    ''', (per_page, offset)).fetchall()
+
+    # Get import stats
+    imports = db.execute('''
+        SELECT COUNT(*) as count, SUM(conversation_count) as total_convos,
+               SUM(message_count) as total_msgs
+        FROM chatgpt_imports
+    ''').fetchone()
+
+    return render_template('chatgpt_list.html',
+                         conversations=conversations,
+                         page=page,
+                         total=total,
+                         per_page=per_page,
+                         imports=imports)
+
+
+@app.route('/chatgpt/<conversation_id>')
+def chatgpt_detail(conversation_id):
+    """View a single ChatGPT conversation."""
+    db = get_db()
+
+    conversation = db.execute('''
+        SELECT * FROM chatgpt_conversations WHERE conversation_id = ?
+    ''', (conversation_id,)).fetchone()
+
+    if not conversation:
+        return "Conversation not found", 404
+
+    messages = db.execute('''
+        SELECT message_id, parent_id, role, content_type, content_text,
+               create_time, model_slug, sequence_number
+        FROM chatgpt_messages
+        WHERE conversation_id = ?
+        ORDER BY sequence_number
+    ''', (conversation['id'],)).fetchall()
+
+    return render_template('chatgpt_detail.html',
+                         conversation=conversation,
+                         messages=messages)
+
+
+@app.route('/api/import/chatgpt', methods=['POST'])
+def import_chatgpt():
+    """Import ChatGPT conversations from uploaded zip file."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+
+    if not file.filename.endswith('.zip'):
+        return jsonify({'error': 'File must be a zip'}), 400
+
+    # Save uploaded file temporarily
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
+        file.save(tmp.name)
+        tmp_path = Path(tmp.name)
+
+    # Import using parser
+    import subprocess
+    import socket
+    device_name = socket.gethostname()
+
+    db_path = Path(DB_PATH)
+    data_dir = db_path.parent / 'data'
+
+    result = subprocess.run([
+        'python3',
+        str(db_path.parent / 'parsers' / 'chatgpt_parser.py'),
+        str(tmp_path),
+        '--db', str(db_path),
+        '--data-dir', str(data_dir),
+        '--device', device_name
+    ], capture_output=True, text=True)
+
+    # Clean up temp file
+    tmp_path.unlink()
+
+    if result.returncode != 0:
+        return jsonify({'error': result.stderr}), 500
+
+    # Parse output for stats
+    output = result.stdout
+    import re
+    new_match = re.search(r'New conversations: (\d+)', output)
+    updated_match = re.search(r'Updated conversations: (\d+)', output)
+    messages_match = re.search(r'Messages imported: (\d+)', output)
+
+    return jsonify({
+        'success': True,
+        'conversations_new': int(new_match.group(1)) if new_match else 0,
+        'conversations_updated': int(updated_match.group(1)) if updated_match else 0,
+        'messages_imported': int(messages_match.group(1)) if messages_match else 0
+    })
+
+
+@app.route('/api/import/chatgpt/history')
+def import_chatgpt_history():
+    """List past ChatGPT imports."""
+    db = get_db()
+
+    imports = db.execute('''
+        SELECT id, original_filename, conversation_count, message_count,
+               imported_at, source_device
+        FROM chatgpt_imports
+        ORDER BY imported_at DESC
+    ''').fetchall()
+
+    return jsonify([dict(row) for row in imports])
 
 
 def main():
