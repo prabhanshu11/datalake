@@ -1,12 +1,12 @@
 [project]
 name = "datalake"
-version = "0.1.0"
-description = "Add your description here"
+version = "2.0.0"
+description = "Personal data lake for Claude Code conversations, voice typing, and email"
 requires-python = ">=3.13"
-dependencies = [
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.32.0",
-]
+dependencies = []
+
+[project.scripts]
+claude-parser = "parsers.claude_parser:main"
 
 [dependency-groups]
 dev = [
