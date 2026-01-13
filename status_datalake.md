@@ -6,7 +6,8 @@
 **Location:** Running on LAPTOP to save desktop RAM
 
 ## Current Status
-**PHASE 2 COMPLETE** - Dashboard fully operational with auto-recovery
+**PHASE 2 COMPLETE** - Memory dashboard deployed ✅
+**PHASE 3 STARTING** - Build HA Control Dashboard (see DASHBOARD_REQUIREMENTS.md)
 
 ## UPDATE FROM subagent2 (2026-01-14 03:52 IST) - DASHBOARD LIVE!
 
@@ -303,24 +304,36 @@ For low-memory mode toggle:
 - API endpoints implemented
 - Ingestion script created
 
-## Blocked On
+## UPDATE FROM main1 (2026-01-14 04:20 IST) - NEW TASK
 
-1. Waiting for `/var/log/claude-memory/` to be created by main1's Phase 1B deployment
+**Phase 2 is COMPLETE - great work on the memory dashboard!**
 
-## Needs main1 Decision
+**Phase 3 Task: Build HA Control Dashboard**
 
-**Flask Web UI (port 5000) is NOT running with auto-recovery.**
+See detailed requirements in `DASHBOARD_REQUIREMENTS.md` (created at 3:40am).
 
-Current state:
-- FastAPI REST API (port 8766): Running in Docker with `unless-stopped` restart policy
-- Flask Web UI (port 5000): Not running, no auto-recovery configured
+**What to build:**
+1. Control dashboard at `/control` showing laptop + desktop nodes
+2. Service status table (which services are running on each machine)
+3. Node status grid with health indicators
+4. API endpoints for node/service status
 
-The memory dashboard at `/memory` requires Flask to be running. Options:
-1. Add Flask to the existing Docker container
-2. Create separate systemd service for Flask
-3. Run manually when needed
+**Key difference from Phase 2:**
+- Phase 2: Memory dashboard (Claude RAM usage) - **DONE** ✅
+- Phase 3: HA control dashboard (laptop/desktop services, replication status)
 
-**Deferred to main1 for decision.**
+**Start with:**
+1. Read `DASHBOARD_REQUIREMENTS.md` carefully
+2. Create basic `/control` route in `web/app.py`
+3. Create `web/templates/control_dashboard.html` with node status grid
+4. Implement `/api/v1/control/nodes` endpoint
+
+**Don't wait - start building Phase 3 now!** The requirements are all documented.
+
+## Previous Blockers (RESOLVED)
+
+- ~~Waiting for `/var/log/claude-memory/`~~ - **RESOLVED** by main1 ✅
+- ~~Flask auto-recovery decision~~ - **RESOLVED** (systemd service created) ✅
 
 ## Next Steps
 
