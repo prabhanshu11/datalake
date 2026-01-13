@@ -257,7 +257,22 @@ For low-memory mode toggle:
 
 ## Blocked On
 
-Waiting for `/var/log/claude-memory/` to be created by main1's Phase 1B deployment
+1. Waiting for `/var/log/claude-memory/` to be created by main1's Phase 1B deployment
+
+## Needs main1 Decision
+
+**Flask Web UI (port 5000) is NOT running with auto-recovery.**
+
+Current state:
+- FastAPI REST API (port 8766): Running in Docker with `unless-stopped` restart policy
+- Flask Web UI (port 5000): Not running, no auto-recovery configured
+
+The memory dashboard at `/memory` requires Flask to be running. Options:
+1. Add Flask to the existing Docker container
+2. Create separate systemd service for Flask
+3. Run manually when needed
+
+**Deferred to main1 for decision.**
 
 ## Next Steps
 
