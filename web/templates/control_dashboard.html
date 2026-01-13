@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HA Control Dashboard - Datalake</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #333;
+        }
+        h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+        }
+        nav a {
+            color: #888;
+            text-decoration: none;
+            margin-left: 20px;
+            transition: color 0.2s;
+        }
+        nav a:hover, nav a.active {
+            color: #fff;
+        }
+        .section {
+            background: #1a1a1a;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid #333;
+        }
+        .section h2 {
+            font-size: 1.1rem;
+            margin-bottom: 15px;
+            color: #ccc;
+        }
+
+        /* Node Grid */
+        .nodes-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+        }
+        .node-card {
+            background: #252525;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #333;
+        }
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .node-name {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+        .node-ip {
+            color: #888;
+            font-size: 0.9rem;
+        }
+        .role-badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .role-badge.primary {
+            background: #3b82f620;
+            color: #3b82f6;
+            border: 1px solid #3b82f640;
+        }
+        .role-badge.replica {
+            background: #8b5cf620;
+            color: #8b5cf6;
+            border: 1px solid #8b5cf640;
+        }
+        .status-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .status-indicator.online { background: #22c55e; box-shadow: 0 0 10px #22c55e80; }
+        .status-indicator.offline { background: #6b7280; }
+        .status-indicator.degraded { background: #f59e0b; box-shadow: 0 0 10px #f59e0b80; }
+        .status-indicator.critical { background: #ef4444; box-shadow: 0 0 10px #ef444480; }
+        .status-text {
+            font-weight: 500;
+        }
+        .status-text.online { color: #22c55e; }
+        .status-text.offline { color: #6b7280; }
+        .status-text.degraded { color: #f59e0b; }
+        .status-text.critical { color: #ef4444; }
+        .last-seen {
+            color: #888;
+            font-size: 0.85rem;
+            margin-left: auto;
+        }
+
+        /* Resource Bars */
+        .resources {
+            margin-top: 15px;
+        }
+        .resource-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        .resource-label {
+            width: 50px;
+            font-size: 0.85rem;
+            color: #888;
+        }
+        .resource-bar {
+            flex: 1;
+            height: 8px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .resource-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s;
+        }
+        .resource-fill.cpu { background: #3b82f6; }
+        .resource-fill.ram { background: #22c55e; }
+        .resource-fill.disk { background: #f59e0b; }
+        .resource-value {
+            width: 45px;
+            text-align: right;
+            font-size: 0.85rem;
+            color: #aaa;
+        }
+
+        /* Services Table */
+        .services-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .services-table th,
+        .services-table td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+        }
+        .services-table th {
+            color: #888;
+            font-weight: 500;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+        }
+        .services-table tr:hover {
+            background: #252525;
+        }
+        .service-name {
+            font-weight: 500;
+        }
+        .service-desc {
+            color: #888;
+            font-size: 0.85rem;
+        }
+        .service-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .service-status .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .service-status .dot.running { background: #22c55e; }
+        .service-status .dot.stopped { background: #ef4444; }
+        .service-status .dot.failed { background: #ef4444; }
+        .service-status .dot.offline { background: #6b7280; }
+        .service-status .dot.unknown { background: #f59e0b; }
+        .service-status .dot.timeout { background: #f59e0b; }
+        .service-status .dot.error { background: #ef4444; }
+
+        /* Footer */
+        .footer {
+            margin-top: 30px;
+            padding-top: 15px;
+            border-top: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            color: #666;
+            font-size: 0.85rem;
+        }
+        .refresh-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .refresh-indicator.loading::before {
+            content: '';
+            width: 12px;
+            height: 12px;
+            border: 2px solid #3b82f640;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>HA Control Dashboard</h1>
+            <nav>
+                <a href="/">Home</a>
+                <a href="/sessions">Sessions</a>
+                <a href="/memory">Memory</a>
+                <a href="/control" class="active">Control</a>
+            </nav>
+        </header>
+
+        <!-- Node Status Grid -->
+        <div class="section">
+            <h2>Node Status</h2>
+            <div class="nodes-grid" id="nodes-grid">
+                <!-- Populated by JavaScript -->
+                <div class="node-card">
+                    <div class="node-header">
+                        <div>
+                            <div class="node-name">Loading...</div>
+                            <div class="node-ip">--</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="node-card">
+                    <div class="node-header">
+                        <div>
+                            <div class="node-name">Loading...</div>
+                            <div class="node-ip">--</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Service Status Table -->
+        <div class="section">
+            <h2>Service Status</h2>
+            <table class="services-table">
+                <thead>
+                    <tr>
+                        <th>Service</th>
+                        <th>Description</th>
+                        <th>Laptop</th>
+                        <th>Desktop</th>
+                    </tr>
+                </thead>
+                <tbody id="services-tbody">
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: #888;">Loading...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="footer">
+            <div>Last updated: <span id="last-updated">{{ last_updated }}</span></div>
+            <div class="refresh-indicator" id="refresh-indicator">
+                Auto-refresh: 5s
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Render node card
+        function renderNodeCard(node) {
+            const statusClass = node.status;
+            const statusText = node.status.charAt(0).toUpperCase() + node.status.slice(1);
+            const roleClass = node.role.toLowerCase();
+            const lastSeen = node.last_heartbeat
+                ? 'Just now'
+                : 'Offline';
+
+            return `
+                <div class="node-card">
+                    <div class="node-header">
+                        <div>
+                            <div class="node-name">${node.name}</div>
+                            <div class="node-ip">${node.ip}</div>
+                        </div>
+                        <span class="role-badge ${roleClass}">${node.role}</span>
+                    </div>
+                    <div class="status-row">
+                        <div class="status-indicator ${statusClass}"></div>
+                        <span class="status-text ${statusClass}">${statusText}</span>
+                        <span class="last-seen">${lastSeen}</span>
+                    </div>
+                    <div class="resources">
+                        <div class="resource-row">
+                            <span class="resource-label">CPU</span>
+                            <div class="resource-bar">
+                                <div class="resource-fill cpu" style="width: ${node.resources.cpu}%"></div>
+                            </div>
+                            <span class="resource-value">${node.resources.cpu}%</span>
+                        </div>
+                        <div class="resource-row">
+                            <span class="resource-label">RAM</span>
+                            <div class="resource-bar">
+                                <div class="resource-fill ram" style="width: ${node.resources.ram}%"></div>
+                            </div>
+                            <span class="resource-value">${node.resources.ram}%</span>
+                        </div>
+                        <div class="resource-row">
+                            <span class="resource-label">Disk</span>
+                            <div class="resource-bar">
+                                <div class="resource-fill disk" style="width: ${node.resources.disk}%"></div>
+                            </div>
+                            <span class="resource-value">${node.resources.disk}%</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Render service row
+        function renderServiceRow(service) {
+            return `
+                <tr>
+                    <td class="service-name">${service.name}</td>
+                    <td class="service-desc">${service.description}</td>
+                    <td>
+                        <div class="service-status">
+                            <span class="dot ${service.laptop.status}"></span>
+                            ${service.laptop.detail}
+                        </div>
+                    </td>
+                    <td>
+                        <div class="service-status">
+                            <span class="dot ${service.desktop.status}"></span>
+                            ${service.desktop.detail}
+                        </div>
+                    </td>
+                </tr>
+            `;
+        }
+
+        // Fetch and update nodes
+        async function updateNodes() {
+            try {
+                const response = await fetch('/api/control/nodes');
+                const nodes = await response.json();
+                const grid = document.getElementById('nodes-grid');
+                grid.innerHTML = nodes.map(renderNodeCard).join('');
+            } catch (error) {
+                console.error('Failed to fetch nodes:', error);
+            }
+        }
+
+        // Fetch and update services
+        async function updateServices() {
+            try {
+                const response = await fetch('/api/control/services');
+                const services = await response.json();
+                const tbody = document.getElementById('services-tbody');
+                tbody.innerHTML = services.map(renderServiceRow).join('');
+            } catch (error) {
+                console.error('Failed to fetch services:', error);
+            }
+        }
+
+        // Update all
+        async function updateAll() {
+            const indicator = document.getElementById('refresh-indicator');
+            indicator.classList.add('loading');
+
+            await Promise.all([updateNodes(), updateServices()]);
+
+            document.getElementById('last-updated').textContent =
+                new Date().toLocaleTimeString();
+            indicator.classList.remove('loading');
+        }
+
+        // Initial load
+        updateAll();
+
+        // Auto-refresh every 5 seconds
+        setInterval(updateAll, 5000);
+    </script>
+</body>
+</html>

@@ -2,14 +2,41 @@
 
 **Assigned to:** subagent2 (Jr. SWE from IIT-Bombay)
 **Coordinator:** main1 (General Engineer/Architect on desktop)
-**Last updated:** 2026-01-14 (Initial creation)
+**Last updated:** 2026-01-14 04:40 IST
 **Location:** Running on LAPTOP to save desktop RAM
 
 ## Current Status
-**PHASE 2 COMPLETE** - Memory dashboard deployed ✅
-**PHASE 3 STARTING** - Build HA Control Dashboard (see DASHBOARD_REQUIREMENTS.md)
+**PHASE 3 COMPLETE** - HA Control Dashboard deployed ✅
 
-## UPDATE FROM subagent2 (2026-01-14 03:52 IST) - DASHBOARD LIVE!
+## UPDATE FROM subagent2 (2026-01-14 04:40 IST) - HA CONTROL DASHBOARD LIVE!
+
+**Phase 3 implementation complete:**
+- ✅ Created `/control` route with node status grid
+- ✅ Created `control_dashboard.html` template with dark theme
+- ✅ Implemented `/api/control/nodes` endpoint (CPU/RAM/Disk for local, ping for remote)
+- ✅ Implemented `/api/control/services` endpoint (systemd + docker status)
+- ✅ Auto-refresh every 5 seconds via JavaScript
+- ✅ All services detected correctly on both nodes
+
+**Dashboard features:**
+- Node status grid showing laptop (PRIMARY) and desktop (REPLICA)
+- Resource usage bars (CPU, RAM, Disk) for local node
+- Service status table with live status indicators
+- Color-coded status: green=running, red=stopped, grey=offline
+
+**Tested and working:**
+- `http://localhost:5050/control` - Dashboard renders correctly
+- `/api/control/nodes` - Returns both nodes with status
+- `/api/control/services` - Returns all 5 services with status on both nodes
+
+**Services detected:**
+- datalake-api (Docker)
+- datalake-web (systemd-user) - Running on laptop
+- claude-memory-monitor (systemd-user) - Running on laptop
+- voice-gateway (systemd-user) - Running on both
+- hyprwhspr (systemd-user) - Running on both
+
+## UPDATE FROM subagent2 (2026-01-14 03:52 IST) - MEMORY DASHBOARD LIVE!
 
 **All systems operational:**
 - ✅ Flask Web UI running on port 5050 via systemd (`datalake-web.service`)

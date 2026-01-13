@@ -326,6 +326,158 @@ docker-compose logs -f
 docker-compose build && docker-compose up -d
 ```
 
+## Web UI
+
+The datalake includes a Flask-based web interface on port **5050** for browsing data and monitoring.
+
+### Starting the Web UI
+
+**Automated (via systemd):**
+```bash
+# Enable and start
+systemctl --user enable --now datalake-web.service
+
+# Check status
+systemctl --user status datalake-web.service
+
+# View logs
+journalctl --user -u datalake-web.service -f
+```
+
+**Manual:**
+```bash
+cd ~/Programs/datalake
+uv run python3 -m web.app --port 5050
+```
+
+### Web UI Endpoints
+
+| URL | Description |
+|-----|-------------|
+| `http://localhost:5050/` | Home page with stats |
+| `http://localhost:5050/sessions` | Browse Claude sessions |
+| `http://localhost:5050/voice` | Voice typing sessions |
+| `http://localhost:5050/chatgpt` | ChatGPT conversations |
+| `http://localhost:5050/search` | Full-text search |
+| `http://localhost:5050/memory` | Memory monitoring dashboard |
+| `http://localhost:5050/memory/events` | Memory event timeline |
+
+---
+
+## Memory Monitoring
+
+Monitor Claude Code memory usage with real-time charts and alerts.
+
+### Overview
+
+The memory monitoring system collects RAM metrics from Claude processes and stores them in the datalake for visualization and analysis.
+
+**Data sources:**
+- `/var/log/claude-memory/metrics.jsonl` - Time-series RAM data (every 10 seconds)
+- `/var/log/claude-memory/events.jsonl` - Memory events (warnings, kills, restarts)
+
+### Database Tables
+
+```sql
+-- Memory metrics (time-series RAM data)
+memory_metrics (
+    pid, session_id, rss_mb, memory_rate_mb_min,
+    timestamp, source_device
+)
+
+-- Memory events (warnings, kills, restarts)
+memory_events (
+    event_type, pid, severity, message,
+    details, timestamp
+)
+```
+
+### Dashboard Features
+
+**Memory Dashboard** (`/memory`):
+- Real-time RAM usage chart (per PID)
+- Rate of change graph (MB/min)
+- Active sessions list with current RAM
+- Low-memory mode toggle per session
+
+**Event Timeline** (`/memory/events`):
+- Chronological event list
+- Filter by event type
+- Color-coded by severity
+
+### API Endpoints
+
+**Flask Web UI (port 5050):**
+```bash
+# Get chart data (for AJAX updates)
+GET /api/memory/chart-data
+
+# List active sessions
+GET /api/memory/sessions
+
+# Toggle low-memory mode for a session
+POST /api/memory/sessions/{pid}/low-memory-mode
+# Body: {"enabled": true}
+```
+
+**FastAPI REST (port 8766):**
+```bash
+# Get today's metrics
+GET /api/v1/memory/metrics/today
+
+# Get metrics for date range
+GET /api/v1/memory/metrics/range?start=2026-01-01&end=2026-01-14
+
+# Get today's events
+GET /api/v1/memory/events/today
+
+# Get events for date range
+GET /api/v1/memory/events/range?start=2026-01-01&end=2026-01-14
+
+# List sessions
+GET /api/v1/memory/sessions
+
+# Toggle low-memory mode
+POST /api/v1/memory/sessions/{pid}/low-memory-mode?enabled=true
+```
+
+### Ingesting Memory Data
+
+**From desktop (via SSH):**
+```bash
+# One-time ingestion
+./scripts/ingest-memory.sh --once
+
+# Watch mode (continuous)
+./scripts/ingest-memory.sh --watch
+
+# Check connectivity
+./scripts/ingest-memory.sh --check
+```
+
+**Direct parser usage:**
+```bash
+# Parse local log files
+uv run python3 -m parsers.memory_parser --log-dir /var/log/claude-memory
+
+# Parse from specific device
+uv run python3 -m parsers.memory_parser --device desktop
+
+# Test mode (dry run)
+uv run python3 -m parsers.memory_parser --test
+```
+
+### Low-Memory Mode
+
+When enabled for a session, creates a control file at:
+```
+/var/log/claude-memory/low-memory-mode/{pid}
+```
+
+The Claude memory monitoring hook reads this file and injects low-memory guidance.
+
+---
+
 ## Getting Started (CLI Tools)
 
 ### Prerequisites
@@ -502,9 +654,10 @@ export DATA_DIR=/mnt/data-ssd/datalake
 ## Future Enhancements
 
 - [x] **Docker Container**: Containerized deployment with isolated environment ✅
+- [x] **REST API**: FastAPI wrapper for HTTP access (port 8766) ✅
+- [x] **Web UI**: Flask dashboard for browsing and searching (port 5050) ✅
+- [x] **Memory Monitoring**: Claude Code RAM tracking with charts ✅
 - [ ] **Vector Search**: Add `sqlite-vss` extension for semantic search
-- [ ] **REST API**: FastAPI/Flask wrapper for HTTP access
-- [ ] **Web UI**: Simple dashboard for browsing and searching
 - [ ] **Screenshot Ingestion**: Script for screenshot ingestion with metadata
 - [ ] **Transcript Ingestion**: Script for transcript ingestion with word count
 - [ ] **Automatic Cleanup**: Script for managing old files and log rotation

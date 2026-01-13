@@ -634,6 +634,30 @@ def memory_events():
                          filter_type=filter_type)
 
 
+@app.route('/api/memory/sessions')
+def api_memory_sessions():
+    """API endpoint for memory sessions list."""
+    db = get_db()
+
+    try:
+        sessions = db.execute('''
+            SELECT m.pid, m.session_id, m.rss_mb, m.memory_rate_mb_min as rate,
+                   m.command, m.timestamp, m.source_device
+            FROM memory_metrics m
+            INNER JOIN (
+                SELECT pid, MAX(timestamp_unix) as max_ts
+                FROM memory_metrics
+                WHERE timestamp_unix > (strftime('%s', 'now') - 3600)
+                GROUP BY pid
+            ) latest ON m.pid = latest.pid AND m.timestamp_unix = latest.max_ts
+            ORDER BY m.rss_mb DESC
+        ''').fetchall()
+
+        return jsonify([dict(row) for row in sessions])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/memory/chart-data')
 def api_memory_chart_data():
     """API endpoint for memory chart data (for AJAX updates)."""
@@ -675,6 +699,226 @@ def toggle_low_memory_mode(pid):
         return jsonify({'success': True, 'pid': pid, 'low_memory_mode': enabled})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# HA Control Dashboard Routes
+# =============================================================================
+
+# Node configuration
+NODES = {
+    'laptop': {
+        'name': 'Laptop (omarchy-1)',
+        'ip': '100.103.8.87',
+        'role': 'PRIMARY',
+        'is_local': True,  # This is the laptop
+    },
+    'desktop': {
+        'name': 'Desktop (omarchy)',
+        'ip': '100.92.71.80',
+        'role': 'REPLICA',
+        'is_local': False,
+    }
+}
+
+# Services to monitor
+SERVICES = [
+    {'name': 'datalake-api', 'description': 'REST API (port 8766)', 'type': 'docker'},
+    {'name': 'datalake-web', 'description': 'Web UI (port 5050)', 'type': 'systemd-user'},
+    {'name': 'claude-memory-monitor', 'description': 'Claude RAM monitor', 'type': 'systemd-user'},
+    {'name': 'voice-gateway', 'description': 'Transcription (port 8765)', 'type': 'systemd-user'},
+    {'name': 'hyprwhspr', 'description': 'Voice typing widget', 'type': 'systemd-user'},
+]
+
+
+def check_node_reachable(ip: str, timeout: int = 2) -> bool:
+    """Check if a node is reachable via ping."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['ping', '-c', '1', '-W', str(timeout), ip],
+            capture_output=True, timeout=timeout + 1
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def get_service_status_local(service_name: str, service_type: str) -> dict:
+    """Get status of a local service."""
+    import subprocess
+
+    if service_type == 'docker':
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '--filter', f'name={service_name}', '--format', '{{.Status}}'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                status_text = result.stdout.strip()
+                if 'Up' in status_text:
+                    return {'status': 'running', 'detail': status_text}
+            return {'status': 'stopped', 'detail': 'Not running'}
+        except Exception as e:
+            return {'status': 'error', 'detail': str(e)}
+
+    elif service_type == 'systemd-user':
+        try:
+            result = subprocess.run(
+                ['systemctl', '--user', 'is-active', f'{service_name}.service'],
+                capture_output=True, text=True, timeout=5
+            )
+            status = result.stdout.strip()
+            if status == 'active':
+                return {'status': 'running', 'detail': 'Active'}
+            elif status == 'inactive':
+                return {'status': 'stopped', 'detail': 'Inactive'}
+            elif status == 'failed':
+                return {'status': 'failed', 'detail': 'Failed'}
+            else:
+                return {'status': 'unknown', 'detail': status}
+        except Exception as e:
+            return {'status': 'error', 'detail': str(e)}
+
+    return {'status': 'unknown', 'detail': 'Unknown service type'}
+
+
+def get_service_status_remote(ip: str, service_name: str, service_type: str, timeout: int = 5) -> dict:
+    """Get status of a remote service via SSH."""
+    import subprocess
+
+    if service_type == 'docker':
+        cmd = f"docker ps --filter 'name={service_name}' --format '{{{{.Status}}}}'"
+    else:
+        cmd = f"systemctl --user is-active {service_name}.service"
+
+    try:
+        result = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
+             f'prabhanshu@{ip}', cmd],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        if service_type == 'docker':
+            if result.returncode == 0 and result.stdout.strip():
+                status_text = result.stdout.strip()
+                if 'Up' in status_text:
+                    return {'status': 'running', 'detail': status_text}
+            return {'status': 'stopped', 'detail': 'Not running'}
+        else:
+            status = result.stdout.strip()
+            if status == 'active':
+                return {'status': 'running', 'detail': 'Active'}
+            elif status == 'inactive':
+                return {'status': 'stopped', 'detail': 'Inactive'}
+            elif status == 'failed':
+                return {'status': 'failed', 'detail': 'Failed'}
+            else:
+                return {'status': 'unknown', 'detail': status or 'Unknown'}
+    except subprocess.TimeoutExpired:
+        return {'status': 'timeout', 'detail': 'SSH timeout'}
+    except Exception as e:
+        return {'status': 'error', 'detail': str(e)}
+
+
+def get_system_resources_local() -> dict:
+    """Get local system resources (CPU, RAM, Disk)."""
+    import subprocess
+    try:
+        # CPU usage
+        cpu_result = subprocess.run(
+            ['bash', '-c', "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'"],
+            capture_output=True, text=True, timeout=5
+        )
+        cpu = float(cpu_result.stdout.strip()) if cpu_result.stdout.strip() else 0
+
+        # Memory usage
+        mem_result = subprocess.run(
+            ['bash', '-c', "free | grep Mem | awk '{print $3/$2 * 100}'"],
+            capture_output=True, text=True, timeout=5
+        )
+        ram = float(mem_result.stdout.strip()) if mem_result.stdout.strip() else 0
+
+        # Disk usage
+        disk_result = subprocess.run(
+            ['bash', '-c', "df -h / | tail -1 | awk '{print $5}' | tr -d '%'"],
+            capture_output=True, text=True, timeout=5
+        )
+        disk = float(disk_result.stdout.strip()) if disk_result.stdout.strip() else 0
+
+        return {'cpu': round(cpu, 1), 'ram': round(ram, 1), 'disk': round(disk, 1)}
+    except Exception:
+        return {'cpu': 0, 'ram': 0, 'disk': 0}
+
+
+@app.route('/control')
+def control_dashboard():
+    """HA Control Dashboard - shows node and service status."""
+    return render_template('control_dashboard.html',
+                          nodes=NODES,
+                          services=SERVICES,
+                          last_updated=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+
+@app.route('/api/control/nodes')
+def api_control_nodes():
+    """API endpoint for node status."""
+    from datetime import datetime
+
+    nodes_status = []
+    for node_id, node in NODES.items():
+        is_reachable = True if node['is_local'] else check_node_reachable(node['ip'])
+
+        if is_reachable:
+            if node['is_local']:
+                resources = get_system_resources_local()
+            else:
+                resources = {'cpu': 0, 'ram': 0, 'disk': 0}  # TODO: get remote resources
+            status = 'online'
+        else:
+            resources = {'cpu': 0, 'ram': 0, 'disk': 0}
+            status = 'offline'
+
+        nodes_status.append({
+            'id': node_id,
+            'name': node['name'],
+            'ip': node['ip'],
+            'role': node['role'],
+            'status': status,
+            'last_heartbeat': datetime.now().isoformat() if is_reachable else None,
+            'resources': resources
+        })
+
+    return jsonify(nodes_status)
+
+
+@app.route('/api/control/services')
+def api_control_services():
+    """API endpoint for service status across nodes."""
+    services_status = []
+
+    # Check laptop (local)
+    laptop_reachable = True
+    desktop_reachable = check_node_reachable(NODES['desktop']['ip'])
+
+    for service in SERVICES:
+        laptop_status = get_service_status_local(service['name'], service['type'])
+
+        if desktop_reachable:
+            desktop_status = get_service_status_remote(
+                NODES['desktop']['ip'], service['name'], service['type']
+            )
+        else:
+            desktop_status = {'status': 'offline', 'detail': 'Node offline'}
+
+        services_status.append({
+            'name': service['name'],
+            'description': service['description'],
+            'laptop': laptop_status,
+            'desktop': desktop_status
+        })
+
+    return jsonify(services_status)
 
 
 def main():
