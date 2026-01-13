@@ -192,18 +192,18 @@
             </div>
             <div class="stat-card">
                 <h3>Current RAM Usage</h3>
-                <div class="value {% if stats.current_rss_mb > 3000 %}danger{% elif stats.current_rss_mb > 2000 %}warning{% endif %}">
-                    {{ "%.0f"|format(stats.current_rss_mb) }} MB
+                <div class="value {% if (stats.current_rss_mb or 0) > 3000 %}danger{% elif (stats.current_rss_mb or 0) > 2000 %}warning{% endif %}">
+                    {{ "%.0f"|format(stats.current_rss_mb or 0) }} MB
                 </div>
             </div>
             <div class="stat-card">
                 <h3>Peak Today</h3>
-                <div class="value">{{ "%.0f"|format(stats.peak_rss_mb) }} MB</div>
+                <div class="value">{{ "%.0f"|format(stats.peak_rss_mb or 0) }} MB</div>
             </div>
             <div class="stat-card">
                 <h3>Growth Rate</h3>
-                <div class="value {% if stats.avg_rate > 100 %}warning{% elif stats.avg_rate > 250 %}danger{% endif %}">
-                    {{ "%.1f"|format(stats.avg_rate) }} MB/min
+                <div class="value {% if (stats.avg_rate or 0) > 100 %}warning{% elif (stats.avg_rate or 0) > 250 %}danger{% endif %}">
+                    {{ "%.1f"|format(stats.avg_rate or 0) }} MB/min
                 </div>
             </div>
         </div>

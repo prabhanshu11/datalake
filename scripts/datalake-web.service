@@ -1,0 +1,14 @@
+[Unit]
+Description=Datalake Web UI (Flask Dashboard)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/prabhanshu/Programs/datalake
+ExecStart=/usr/bin/uv run python3 -m web.app --port 5050
+Restart=always
+RestartSec=5
+Environment=PATH=/home/prabhanshu/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

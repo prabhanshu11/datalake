@@ -267,7 +267,7 @@ async def get_memory_metrics_today() -> List[Dict[str, Any]]:
                 SELECT pid, session_id, rss_mb, memory_rate_mb_min,
                        timestamp, timestamp_unix
                 FROM memory_metrics
-                WHERE date(timestamp) = date('now')
+                WHERE date(timestamp) = date('now', 'localtime')
                 ORDER BY timestamp_unix ASC
             """)
             rows = cursor.fetchall()
@@ -308,7 +308,7 @@ async def get_memory_events_today() -> List[Dict[str, Any]]:
                 SELECT event_type, pid, session_id, severity,
                        message, details, timestamp, timestamp_unix
                 FROM memory_events
-                WHERE date(timestamp) = date('now')
+                WHERE date(timestamp) = date('now', 'localtime')
                 ORDER BY timestamp_unix DESC
             """)
             rows = cursor.fetchall()

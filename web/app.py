@@ -460,13 +460,13 @@ def memory_dashboard():
         peak = db.execute('''
             SELECT MAX(rss_mb) as peak
             FROM memory_metrics
-            WHERE date(timestamp) = date('now')
+            WHERE date(timestamp) = date('now', 'localtime')
         ''').fetchone()
 
         avg_rate = db.execute('''
             SELECT AVG(memory_rate_mb_min) as avg_rate
             FROM memory_metrics
-            WHERE date(timestamp) = date('now')
+            WHERE date(timestamp) = date('now', 'localtime')
         ''').fetchone()
 
         active = db.execute('''
@@ -511,7 +511,7 @@ def memory_dashboard():
         metrics = db.execute('''
             SELECT pid, rss_mb, timestamp
             FROM memory_metrics
-            WHERE date(timestamp) = date('now')
+            WHERE date(timestamp) = date('now', 'localtime')
             ORDER BY timestamp_unix ASC
         ''').fetchall()
 
@@ -548,7 +548,7 @@ def memory_dashboard():
         rate_metrics = db.execute('''
             SELECT memory_rate_mb_min as rate, timestamp
             FROM memory_metrics
-            WHERE date(timestamp) = date('now') AND memory_rate_mb_min IS NOT NULL
+            WHERE date(timestamp) = date('now', 'localtime') AND memory_rate_mb_min IS NOT NULL
             ORDER BY timestamp_unix ASC
         ''').fetchall()
 
@@ -592,7 +592,7 @@ def memory_events():
             "SELECT COUNT(*) as c FROM memory_events WHERE severity = 'critical'"
         ).fetchone()
         kills_row = db.execute(
-            "SELECT COUNT(*) as c FROM memory_events WHERE event_type = 'process_kill' AND date(timestamp) = date('now')"
+            "SELECT COUNT(*) as c FROM memory_events WHERE event_type = 'process_kill' AND date(timestamp) = date('now', 'localtime')"
         ).fetchone()
 
         stats = {
@@ -643,7 +643,7 @@ def api_memory_chart_data():
         metrics = db.execute('''
             SELECT pid, rss_mb, memory_rate_mb_min, timestamp
             FROM memory_metrics
-            WHERE date(timestamp) = date('now')
+            WHERE date(timestamp) = date('now', 'localtime')
             ORDER BY timestamp_unix ASC
         ''').fetchall()
 
