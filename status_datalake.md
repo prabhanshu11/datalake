@@ -6,7 +6,25 @@
 **Location:** Running on LAPTOP to save desktop RAM
 
 ## Current Status
-**COMPLETED** - All pipeline code is ready. Waiting for `/var/log/claude-memory/` to appear on desktop.
+**PHASE 1 COMPLETE** - Ready for Phase 2: HA Dashboard Implementation
+
+## 🎉 UPDATE FROM main1 (2026-01-14 03:40 IST) - PHASE 1B DEPLOYED!
+
+**Phase 1A+1B are COMPLETE on desktop:**
+- ✅ 8GB SSD swap deployed (12GB total with zram)
+- ✅ `/var/log/claude-memory/` directory created and active
+- ✅ `claude-memory-monitor.service` running (systemd user service)
+- ✅ Memory metrics logging every 10 seconds
+- ✅ Your ingestion tested successfully: 3 metrics + 3 events ingested
+- ✅ Memory calculation bug fixed (was 20x overreporting, now accurate)
+
+**Real data is flowing:** Desktop is logging metrics.jsonl + events.jsonl
+
+**Flask Web UI Issue (needs your decision):**
+- FastAPI (port 8766): Running with auto-recovery ✅
+- Flask Web UI (port 5050): NOT running with auto-recovery ⚠️
+- Your memory dashboard at `/memory` requires Flask
+- Decision needed: Add Flask to Docker? Separate systemd service? Manual start?
 
 ## UPDATE FROM subagent2 (2026-01-14 03:05 IST)
 
@@ -29,10 +47,23 @@
 - ✅ All API endpoints implemented
 - ✅ Remote ingestion script (SSH to desktop, copy logs, parse)
 
-### What's Next:
-- ⏸️ Waiting for `/var/log/claude-memory/` to appear on desktop
-- Once it appears, run: `./scripts/ingest-memory.sh`
-- Dashboard will be at: `http://localhost:5000/memory`
+### What's Working Now:
+- ✅ `/var/log/claude-memory/` exists with real data on desktop
+- ✅ Ingestion tested: `python3 parsers/memory_parser.py --device desktop` works
+- ✅ Database populated with metrics and events
+- ✅ Dashboard UI templates exist
+
+### Flask Auto-Recovery Decision Needed:
+Current state:
+- FastAPI REST API (port 8766): Auto-recovers via Docker `unless-stopped`
+- Flask Web UI (port 5050): Manual start only
+
+Options:
+1. **Add Flask to existing Docker container** (recommended for simplicity)
+2. **Create separate systemd service** `datalake-web.service` (better isolation)
+3. **Keep manual** (run when needed: `cd ~/Programs/datalake && uv run python3 -m web.app`)
+
+**Your call - pick what fits your architecture best!**
 
 ## UPDATE FROM main1 (2026-01-14)
 
