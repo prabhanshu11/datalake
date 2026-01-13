@@ -438,6 +438,245 @@ def import_chatgpt_history():
     return jsonify([dict(row) for row in imports])
 
 
+# =============================================================================
+# Memory Monitoring Routes
+# =============================================================================
+
+@app.route('/memory')
+def memory_dashboard():
+    """Memory monitoring dashboard with RAM charts."""
+    db = get_db()
+
+    # Get stats
+    try:
+        # Current stats from latest metrics
+        latest = db.execute('''
+            SELECT rss_mb, memory_rate_mb_min
+            FROM memory_metrics
+            ORDER BY timestamp_unix DESC
+            LIMIT 1
+        ''').fetchone()
+
+        peak = db.execute('''
+            SELECT MAX(rss_mb) as peak
+            FROM memory_metrics
+            WHERE date(timestamp) = date('now')
+        ''').fetchone()
+
+        avg_rate = db.execute('''
+            SELECT AVG(memory_rate_mb_min) as avg_rate
+            FROM memory_metrics
+            WHERE date(timestamp) = date('now')
+        ''').fetchone()
+
+        active = db.execute('''
+            SELECT COUNT(DISTINCT pid) as count
+            FROM memory_metrics
+            WHERE timestamp_unix > (strftime('%s', 'now') - 300)
+        ''').fetchone()
+
+        stats = {
+            'current_rss_mb': latest['rss_mb'] if latest else 0,
+            'peak_rss_mb': peak['peak'] if peak else 0,
+            'avg_rate': avg_rate['avg_rate'] if avg_rate and avg_rate['avg_rate'] else 0,
+            'active_sessions': active['count'] if active else 0,
+        }
+    except Exception:
+        stats = {
+            'current_rss_mb': 0,
+            'peak_rss_mb': 0,
+            'avg_rate': 0,
+            'active_sessions': 0,
+        }
+
+    # Get sessions with latest metrics
+    try:
+        sessions = db.execute('''
+            SELECT m.pid, m.session_id, m.rss_mb, m.memory_rate_mb_min as rate,
+                   m.command, m.timestamp
+            FROM memory_metrics m
+            INNER JOIN (
+                SELECT pid, MAX(timestamp_unix) as max_ts
+                FROM memory_metrics
+                WHERE timestamp_unix > (strftime('%s', 'now') - 3600)
+                GROUP BY pid
+            ) latest ON m.pid = latest.pid AND m.timestamp_unix = latest.max_ts
+            ORDER BY m.rss_mb DESC
+        ''').fetchall()
+    except Exception:
+        sessions = []
+
+    # Get chart data
+    try:
+        metrics = db.execute('''
+            SELECT pid, rss_mb, timestamp
+            FROM memory_metrics
+            WHERE date(timestamp) = date('now')
+            ORDER BY timestamp_unix ASC
+        ''').fetchall()
+
+        # Group by PID for multiple lines
+        pids = {}
+        labels = []
+        for m in metrics:
+            pid = m['pid']
+            if pid not in pids:
+                pids[pid] = {'label': f'PID {pid}', 'data': []}
+            pids[pid]['data'].append(m['rss_mb'])
+            # Only add unique timestamps
+            ts = m['timestamp'].split('T')[1][:5] if 'T' in m['timestamp'] else m['timestamp']
+            if ts not in labels:
+                labels.append(ts)
+
+        # Create chart data structure
+        colors = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4']
+        datasets = []
+        for i, (pid, data) in enumerate(pids.items()):
+            color = colors[i % len(colors)]
+            datasets.append({
+                'label': data['label'],
+                'data': data['data'],
+                'borderColor': color,
+                'backgroundColor': f'{color}20',
+                'fill': False,
+                'tension': 0.3
+            })
+
+        chart_data = {'labels': labels, 'datasets': datasets}
+
+        # Rate data
+        rate_metrics = db.execute('''
+            SELECT memory_rate_mb_min as rate, timestamp
+            FROM memory_metrics
+            WHERE date(timestamp) = date('now') AND memory_rate_mb_min IS NOT NULL
+            ORDER BY timestamp_unix ASC
+        ''').fetchall()
+
+        rate_labels = []
+        rate_values = []
+        for m in rate_metrics:
+            ts = m['timestamp'].split('T')[1][:5] if 'T' in m['timestamp'] else m['timestamp']
+            rate_labels.append(ts)
+            rate_values.append(m['rate'] or 0)
+
+        rate_data = {'labels': rate_labels, 'values': rate_values}
+
+    except Exception:
+        chart_data = {'labels': [], 'datasets': []}
+        rate_data = {'labels': [], 'values': []}
+
+    return render_template('memory.html',
+                         stats=stats,
+                         sessions=sessions,
+                         chart_data=chart_data,
+                         rate_data=rate_data,
+                         last_updated=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+
+@app.route('/memory/events')
+def memory_events():
+    """Memory events timeline."""
+    db = get_db()
+    page = request.args.get('page', 1, type=int)
+    filter_type = request.args.get('type', None)
+    per_page = 50
+    offset = (page - 1) * per_page
+
+    # Get stats
+    try:
+        total_row = db.execute('SELECT COUNT(*) as c FROM memory_events').fetchone()
+        warnings_row = db.execute(
+            "SELECT COUNT(*) as c FROM memory_events WHERE severity = 'warning'"
+        ).fetchone()
+        critical_row = db.execute(
+            "SELECT COUNT(*) as c FROM memory_events WHERE severity = 'critical'"
+        ).fetchone()
+        kills_row = db.execute(
+            "SELECT COUNT(*) as c FROM memory_events WHERE event_type = 'process_kill' AND date(timestamp) = date('now')"
+        ).fetchone()
+
+        stats = {
+            'total': total_row['c'] if total_row else 0,
+            'warnings': warnings_row['c'] if warnings_row else 0,
+            'critical': critical_row['c'] if critical_row else 0,
+            'kills': kills_row['c'] if kills_row else 0,
+        }
+    except Exception:
+        stats = {'total': 0, 'warnings': 0, 'critical': 0, 'kills': 0}
+
+    # Get events
+    try:
+        query = '''
+            SELECT event_type, pid, session_id, severity, message, details, timestamp
+            FROM memory_events
+        '''
+        params = []
+
+        if filter_type:
+            query += ' WHERE event_type = ?'
+            params.append(filter_type)
+
+        query += ' ORDER BY timestamp_unix DESC LIMIT ? OFFSET ?'
+        params.extend([per_page, offset])
+
+        events = db.execute(query, params).fetchall()
+        total = stats['total']
+    except Exception:
+        events = []
+        total = 0
+
+    return render_template('memory_events.html',
+                         events=events,
+                         stats=stats,
+                         page=page,
+                         per_page=per_page,
+                         total=total,
+                         filter_type=filter_type)
+
+
+@app.route('/api/memory/chart-data')
+def api_memory_chart_data():
+    """API endpoint for memory chart data (for AJAX updates)."""
+    db = get_db()
+
+    try:
+        metrics = db.execute('''
+            SELECT pid, rss_mb, memory_rate_mb_min, timestamp
+            FROM memory_metrics
+            WHERE date(timestamp) = date('now')
+            ORDER BY timestamp_unix ASC
+        ''').fetchall()
+
+        return jsonify([dict(row) for row in metrics])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/memory/sessions/<int:pid>/low-memory-mode', methods=['POST'])
+def toggle_low_memory_mode(pid):
+    """Toggle low-memory mode for a specific session."""
+    from pathlib import Path
+
+    data = request.get_json() or {}
+    enabled = data.get('enabled', True)
+
+    try:
+        control_dir = Path('/var/log/claude-memory/low-memory-mode')
+        control_dir.mkdir(parents=True, exist_ok=True)
+
+        control_file = control_dir / str(pid)
+
+        if enabled:
+            control_file.write_text('1')
+        else:
+            if control_file.exists():
+                control_file.unlink()
+
+        return jsonify({'success': True, 'pid': pid, 'low_memory_mode': enabled})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 def main():
     """Run the web server."""
     import argparse
