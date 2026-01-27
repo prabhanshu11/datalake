@@ -718,6 +718,13 @@ NODES = {
         'ip': '100.92.71.80',
         'role': 'REPLICA',
         'is_local': False,
+    },
+    'pi-nas': {
+        'name': 'Pi 5 NAS (rpi5)',
+        'ip': '192.168.50.1',
+        'role': 'NAS',
+        'is_local': False,
+        'network': 'pi-hotspot',  # Only reachable via Pi hotspot WiFi
     }
 }
 
@@ -729,6 +736,15 @@ SERVICES = [
     {'name': 'voice-gateway', 'description': 'Transcription (port 8765)', 'type': 'systemd-user'},
     {'name': 'hyprwhspr', 'description': 'Voice typing widget', 'type': 'systemd-user'},
 ]
+
+# Pi NAS services (separate since they're on a different network)
+PI_SERVICES = [
+    {'name': 'smbd', 'description': 'Samba file sharing', 'type': 'systemd'},
+    {'name': 'filebrowser', 'description': 'Web file browser (port 8080)', 'type': 'systemd'},
+]
+
+# Pi NAS database path
+PI_FILES_DB = '/mnt/nas/prabhanshu-files/prabhanshu-files.db'
 
 
 def check_node_reachable(ip: str, timeout: int = 2) -> bool:
@@ -787,15 +803,22 @@ def get_service_status_remote(ip: str, service_name: str, service_type: str, tim
     """Get status of a remote service via SSH."""
     import subprocess
 
+    # Determine SSH user based on IP (Pi uses 'pi', others use 'prabhanshu')
+    ssh_user = 'pi' if '192.168.50' in ip else 'prabhanshu'
+
     if service_type == 'docker':
         cmd = f"docker ps --filter 'name={service_name}' --format '{{{{.Status}}}}'"
+    elif service_type == 'systemd':
+        # System-level systemd service (requires sudo or runs as system)
+        cmd = f"systemctl is-active {service_name}.service"
     else:
+        # User-level systemd service
         cmd = f"systemctl --user is-active {service_name}.service"
 
     try:
         result = subprocess.run(
             ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
-             f'prabhanshu@{ip}', cmd],
+             f'{ssh_user}@{ip}', cmd],
             capture_output=True, text=True, timeout=timeout
         )
 
@@ -919,6 +942,167 @@ def api_control_services():
         })
 
     return jsonify(services_status)
+
+
+# =============================================================================
+# Pi NAS Routes
+# =============================================================================
+
+@app.route('/api/pi-nas/status')
+def api_pi_nas_status():
+    """API endpoint for Pi NAS status."""
+    import subprocess
+
+    pi_ip = NODES['pi-nas']['ip']
+    is_reachable = check_node_reachable(pi_ip)
+
+    result = {
+        'node': 'pi-nas',
+        'ip': pi_ip,
+        'reachable': is_reachable,
+        'services': [],
+        'storage': {},
+        'files_db': {}
+    }
+
+    if not is_reachable:
+        result['error'] = 'Pi NAS not reachable (connect to Pi hotspot WiFi)'
+        return jsonify(result)
+
+    # Check Pi services
+    for service in PI_SERVICES:
+        try:
+            status = get_service_status_remote(pi_ip, service['name'], service['type'], timeout=10)
+            result['services'].append({
+                'name': service['name'],
+                'description': service['description'],
+                'status': status['status'],
+                'detail': status['detail']
+            })
+        except Exception as e:
+            result['services'].append({
+                'name': service['name'],
+                'description': service['description'],
+                'status': 'error',
+                'detail': str(e)
+            })
+
+    # Get storage info via SSH
+    try:
+        storage_cmd = "df -h /mnt/nas/* 2>/dev/null | tail -n +2 | awk '{print $1,$2,$3,$4,$5,$6}'"
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
+             f'pi@{pi_ip}', storage_cmd],
+            capture_output=True, text=True, timeout=10
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 6:
+                    mount = parts[5]
+                    name = mount.split('/')[-1]
+                    result['storage'][name] = {
+                        'device': parts[0],
+                        'size': parts[1],
+                        'used': parts[2],
+                        'avail': parts[3],
+                        'use_pct': parts[4],
+                        'mount': mount
+                    }
+    except Exception as e:
+        result['storage_error'] = str(e)
+
+    # Get prabhanshu-files database stats
+    try:
+        db_cmd = f"sqlite3 {PI_FILES_DB} \"SELECT source_service, COUNT(*) as count, SUM(size_bytes) as bytes FROM files GROUP BY source_service;\""
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
+             f'pi@{pi_ip}', db_cmd],
+            capture_output=True, text=True, timeout=10
+        )
+        if proc.returncode == 0:
+            stats = {}
+            for line in proc.stdout.strip().split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    service = parts[0]
+                    stats[service] = {
+                        'count': int(parts[1]),
+                        'bytes': int(parts[2]) if parts[2] else 0
+                    }
+            result['files_db'] = {
+                'status': 'indexed',
+                'by_service': stats,
+                'total_files': sum(s['count'] for s in stats.values()),
+                'total_bytes': sum(s['bytes'] for s in stats.values())
+            }
+        else:
+            result['files_db'] = {'status': 'error', 'error': proc.stderr}
+    except Exception as e:
+        result['files_db'] = {'status': 'error', 'error': str(e)}
+
+    return jsonify(result)
+
+
+@app.route('/api/pi-nas/search')
+def api_pi_nas_search():
+    """Search files in prabhanshu-files database on Pi NAS."""
+    import subprocess
+
+    query = request.args.get('q', '')
+    service = request.args.get('service', None)
+    limit = request.args.get('limit', 50, type=int)
+
+    pi_ip = NODES['pi-nas']['ip']
+    is_reachable = check_node_reachable(pi_ip)
+
+    if not is_reachable:
+        return jsonify({'error': 'Pi NAS not reachable'}), 503
+
+    if not query:
+        return jsonify({'error': 'Query required'}), 400
+
+    # Build SQL query
+    sql = f"""
+        SELECT f.path, f.filename, f.size_bytes, f.source_service, f.source_archive
+        FROM files f
+        WHERE f.id IN (
+            SELECT rowid FROM files_fts WHERE files_fts MATCH '{query}'
+        )
+    """
+    if service:
+        sql += f" AND f.source_service = '{service}'"
+    sql += f" LIMIT {limit};"
+
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
+             f'pi@{pi_ip}', f'sqlite3 -separator "|" {PI_FILES_DB} "{sql}"'],
+            capture_output=True, text=True, timeout=30
+        )
+
+        results = []
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.strip().split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 5:
+                    results.append({
+                        'path': parts[0],
+                        'filename': parts[1],
+                        'size_bytes': int(parts[2]) if parts[2] else 0,
+                        'service': parts[3],
+                        'archive': parts[4]
+                    })
+
+        return jsonify({
+            'query': query,
+            'service': service,
+            'count': len(results),
+            'results': results
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def main():
