@@ -28,6 +28,8 @@ AUDIO_DIRS = [
 # Configuration
 DB_PATH = os.environ.get('DATALAKE_DB',
     str(Path.home() / 'Programs' / 'datalake' / 'datalake.db'))
+LOCAL_FILES_DB = os.environ.get('FILES_DB',
+    str(Path.home() / 'Programs' / 'takeout-parser' / 'local-index.db'))
 
 
 def get_db():
@@ -38,12 +40,25 @@ def get_db():
     return g.db
 
 
+def get_files_db():
+    """Get files database connection for current request."""
+    if 'files_db' not in g:
+        if not os.path.exists(LOCAL_FILES_DB):
+            return None
+        g.files_db = sqlite3.connect(LOCAL_FILES_DB)
+        g.files_db.row_factory = sqlite3.Row
+    return g.files_db
+
+
 @app.teardown_appcontext
 def close_db(error):
-    """Close database connection at end of request."""
+    """Close database connections at end of request."""
     db = g.pop('db', None)
     if db is not None:
         db.close()
+    files_db = g.pop('files_db', None)
+    if files_db is not None:
+        files_db.close()
 
 
 @app.route('/audio/<path:filename>')
@@ -69,6 +84,19 @@ def index():
         'audio_files': db.execute('SELECT COUNT(*) FROM audio').fetchone()[0],
         'transcripts': db.execute('SELECT COUNT(*) FROM transcripts').fetchone()[0],
     }
+
+    # Drive files stats from local files DB
+    files_db = get_files_db()
+    if files_db:
+        try:
+            drive_row = files_db.execute(
+                "SELECT COUNT(*) FROM files WHERE source_service = 'drive'"
+            ).fetchone()
+            stats['drive_files'] = drive_row[0] if drive_row else 0
+        except Exception:
+            stats['drive_files'] = 0
+    else:
+        stats['drive_files'] = 0
 
     # Recent sessions
     recent = db.execute('''
@@ -721,10 +749,9 @@ NODES = {
     },
     'pi-nas': {
         'name': 'Pi 5 NAS (rpi5)',
-        'ip': '192.168.50.1',
+        'ssh_alias': 'pi5',
         'role': 'NAS',
         'is_local': False,
-        'network': 'pi-hotspot',  # Only reachable via Pi hotspot WiFi
     }
 }
 
@@ -747,14 +774,20 @@ PI_SERVICES = [
 PI_FILES_DB = '/mnt/nas/prabhanshu-files/prabhanshu-files.db'
 
 
-def check_node_reachable(ip: str, timeout: int = 2) -> bool:
-    """Check if a node is reachable via ping."""
+def check_node_reachable(host: str, timeout: int = 2, use_ssh: bool = False) -> bool:
+    """Check if a node is reachable via ping or SSH."""
     import subprocess
     try:
-        result = subprocess.run(
-            ['ping', '-c', '1', '-W', str(timeout), ip],
-            capture_output=True, timeout=timeout + 1
-        )
+        if use_ssh:
+            result = subprocess.run(
+                ['ssh', '-o', f'ConnectTimeout={timeout}', host, 'true'],
+                capture_output=True, timeout=timeout + 3
+            )
+        else:
+            result = subprocess.run(
+                ['ping', '-c', '1', '-W', str(timeout), host],
+                capture_output=True, timeout=timeout + 1
+            )
         return result.returncode == 0
     except Exception:
         return False
@@ -844,6 +877,45 @@ def get_service_status_remote(ip: str, service_name: str, service_type: str, tim
         return {'status': 'error', 'detail': str(e)}
 
 
+def get_service_status_remote_ssh(ssh_alias: str, service_name: str, service_type: str, timeout: int = 5) -> dict:
+    """Get status of a remote service via SSH alias."""
+    import subprocess
+
+    if service_type == 'docker':
+        cmd = f"docker ps --filter 'name={service_name}' --format '{{{{.Status}}}}'"
+    elif service_type == 'systemd':
+        cmd = f"systemctl is-active {service_name}.service"
+    else:
+        cmd = f"systemctl --user is-active {service_name}.service"
+
+    try:
+        result = subprocess.run(
+            ['ssh', '-o', f'ConnectTimeout={timeout}', ssh_alias, cmd],
+            capture_output=True, text=True, timeout=timeout + 3
+        )
+
+        if service_type == 'docker':
+            if result.returncode == 0 and result.stdout.strip():
+                status_text = result.stdout.strip()
+                if 'Up' in status_text:
+                    return {'status': 'running', 'detail': status_text}
+            return {'status': 'stopped', 'detail': 'Not running'}
+        else:
+            status = result.stdout.strip()
+            if status == 'active':
+                return {'status': 'running', 'detail': 'Active'}
+            elif status == 'inactive':
+                return {'status': 'stopped', 'detail': 'Inactive'}
+            elif status == 'failed':
+                return {'status': 'failed', 'detail': 'Failed'}
+            else:
+                return {'status': 'unknown', 'detail': status or 'Unknown'}
+    except subprocess.TimeoutExpired:
+        return {'status': 'timeout', 'detail': 'SSH timeout'}
+    except Exception as e:
+        return {'status': 'error', 'detail': str(e)}
+
+
 def get_system_resources_local() -> dict:
     """Get local system resources (CPU, RAM, Disk)."""
     import subprocess
@@ -890,7 +962,12 @@ def api_control_nodes():
 
     nodes_status = []
     for node_id, node in NODES.items():
-        is_reachable = True if node['is_local'] else check_node_reachable(node['ip'])
+        if node['is_local']:
+            is_reachable = True
+        elif 'ssh_alias' in node:
+            is_reachable = check_node_reachable(node['ssh_alias'], use_ssh=True)
+        else:
+            is_reachable = check_node_reachable(node['ip'])
 
         if is_reachable:
             if node['is_local']:
@@ -905,7 +982,7 @@ def api_control_nodes():
         nodes_status.append({
             'id': node_id,
             'name': node['name'],
-            'ip': node['ip'],
+            'ip': node.get('ip', node.get('ssh_alias', '')),
             'role': node['role'],
             'status': status,
             'last_heartbeat': datetime.now().isoformat() if is_reachable else None,
@@ -953,12 +1030,12 @@ def api_pi_nas_status():
     """API endpoint for Pi NAS status."""
     import subprocess
 
-    pi_ip = NODES['pi-nas']['ip']
-    is_reachable = check_node_reachable(pi_ip)
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    is_reachable = check_node_reachable(pi_ssh, use_ssh=True)
 
     result = {
         'node': 'pi-nas',
-        'ip': pi_ip,
+        'ssh_alias': pi_ssh,
         'reachable': is_reachable,
         'services': [],
         'storage': {},
@@ -966,13 +1043,13 @@ def api_pi_nas_status():
     }
 
     if not is_reachable:
-        result['error'] = 'Pi NAS not reachable (connect to Pi hotspot WiFi)'
+        result['error'] = 'Pi NAS not reachable via SSH (check pi5 SSH alias)'
         return jsonify(result)
 
     # Check Pi services
     for service in PI_SERVICES:
         try:
-            status = get_service_status_remote(pi_ip, service['name'], service['type'], timeout=10)
+            status = get_service_status_remote_ssh(pi_ssh, service['name'], service['type'], timeout=10)
             result['services'].append({
                 'name': service['name'],
                 'description': service['description'],
@@ -991,8 +1068,7 @@ def api_pi_nas_status():
     try:
         storage_cmd = "df -h /mnt/nas/* 2>/dev/null | tail -n +2 | awk '{print $1,$2,$3,$4,$5,$6}'"
         proc = subprocess.run(
-            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
-             f'pi@{pi_ip}', storage_cmd],
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh, storage_cmd],
             capture_output=True, text=True, timeout=10
         )
         if proc.returncode == 0:
@@ -1016,8 +1092,7 @@ def api_pi_nas_status():
     try:
         db_cmd = f"sqlite3 {PI_FILES_DB} \"SELECT source_service, COUNT(*) as count, SUM(size_bytes) as bytes FROM files GROUP BY source_service;\""
         proc = subprocess.run(
-            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
-             f'pi@{pi_ip}', db_cmd],
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh, db_cmd],
             capture_output=True, text=True, timeout=10
         )
         if proc.returncode == 0:
@@ -1053,8 +1128,8 @@ def api_pi_nas_search():
     service = request.args.get('service', None)
     limit = request.args.get('limit', 50, type=int)
 
-    pi_ip = NODES['pi-nas']['ip']
-    is_reachable = check_node_reachable(pi_ip)
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    is_reachable = check_node_reachable(pi_ssh, use_ssh=True)
 
     if not is_reachable:
         return jsonify({'error': 'Pi NAS not reachable'}), 503
@@ -1076,8 +1151,8 @@ def api_pi_nas_search():
 
     try:
         proc = subprocess.run(
-            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
-             f'pi@{pi_ip}', f'sqlite3 -separator "|" {PI_FILES_DB} "{sql}"'],
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 -separator "|" {PI_FILES_DB} "{sql}"'],
             capture_output=True, text=True, timeout=30
         )
 
@@ -1103,6 +1178,286 @@ def api_pi_nas_search():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# Google Drive Browser Routes
+# =============================================================================
+
+DRIVE_PATH_PREFIX = 'Takeout/Drive/'
+DRIVE_PREFIX_LEN = len(DRIVE_PATH_PREFIX)
+
+
+def _query_drive_local(db, path=None, query=None, ext=None, page=1, per_page=50):
+    """Query Drive files from local files DB."""
+    params = []
+    where_clauses = ["f.source_service = 'drive'"]
+
+    if query:
+        where_clauses.append(
+            "f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)"
+        )
+        params.append(query)
+
+    if path:
+        where_clauses.append("f.path LIKE ?")
+        params.append(f'{DRIVE_PATH_PREFIX}{path}/%')
+
+    if ext:
+        where_clauses.append("f.extension = ?")
+        params.append(ext)
+
+    where_sql = ' AND '.join(where_clauses)
+    offset = (page - 1) * per_page
+
+    total = db.execute(
+        f'SELECT COUNT(*) FROM files f WHERE {where_sql}', params
+    ).fetchone()[0]
+
+    files = db.execute(f'''
+        SELECT f.path, f.filename, f.extension, f.size_bytes,
+               f.source_archive, f.created_at, f.modified_at
+        FROM files f
+        WHERE {where_sql}
+        ORDER BY f.path
+        LIMIT ? OFFSET ?
+    ''', params + [per_page, offset]).fetchall()
+
+    return files, total
+
+
+def _query_drive_pi_nas(path=None, query=None, ext=None, page=1, per_page=50):
+    """Fallback: query Drive files from Pi NAS via SSH."""
+    import subprocess
+
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    if not check_node_reachable(pi_ssh, use_ssh=True):
+        return [], 0
+
+    params_parts = ["source_service = 'drive'"]
+    if query:
+        params_parts.append(
+            f"id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH '{query}')"
+        )
+    if path:
+        params_parts.append(f"path LIKE '{DRIVE_PATH_PREFIX}{path}/%'")
+    if ext:
+        params_parts.append(f"extension = '{ext}'")
+
+    where_sql = ' AND '.join(params_parts)
+    offset = (page - 1) * per_page
+
+    # Get count
+    count_sql = f"SELECT COUNT(*) FROM files WHERE {where_sql};"
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 {PI_FILES_DB} "{count_sql}"'],
+            capture_output=True, text=True, timeout=15
+        )
+        total = int(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else 0
+    except Exception:
+        return [], 0
+
+    # Get files
+    files_sql = f"""SELECT path, filename, extension, size_bytes, source_archive, created_at, modified_at
+        FROM files WHERE {where_sql} ORDER BY path LIMIT {per_page} OFFSET {offset};"""
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 -separator "|" {PI_FILES_DB} "{files_sql}"'],
+            capture_output=True, text=True, timeout=30
+        )
+        files = []
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.strip().split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 7:
+                    files.append({
+                        'path': parts[0],
+                        'filename': parts[1],
+                        'extension': parts[2],
+                        'size_bytes': int(parts[3]) if parts[3] else 0,
+                        'source_archive': parts[4],
+                        'created_at': parts[5],
+                        'modified_at': parts[6],
+                    })
+        return files, total
+    except Exception:
+        return [], 0
+
+
+def _get_drive_folders(db, parent_path=None):
+    """Get immediate subfolders under a Drive path."""
+    if parent_path:
+        prefix = f'{DRIVE_PATH_PREFIX}{parent_path}/'
+    else:
+        prefix = DRIVE_PATH_PREFIX
+
+    prefix_len = len(prefix)
+
+    rows = db.execute('''
+        SELECT DISTINCT SUBSTR(path, ?, INSTR(SUBSTR(path, ?), '/') - 1) as folder
+        FROM files
+        WHERE source_service = 'drive'
+          AND path LIKE ?
+          AND INSTR(SUBSTR(path, ?), '/') > 0
+        ORDER BY folder
+    ''', (prefix_len + 1, prefix_len + 1, f'{prefix}%', prefix_len + 1)).fetchall()
+
+    return [r['folder'] for r in rows if r['folder']]
+
+
+def _get_drive_stats(db):
+    """Get Drive file stats from local DB."""
+    row = db.execute('''
+        SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as bytes,
+               COUNT(DISTINCT source_archive) as archives
+        FROM files WHERE source_service = 'drive'
+    ''').fetchone()
+    return {
+        'count': row['count'],
+        'bytes': row['bytes'],
+        'archives': row['archives'],
+    }
+
+
+def _get_drive_extensions(db):
+    """Get top file extensions for Drive files."""
+    rows = db.execute('''
+        SELECT extension, COUNT(*) as count
+        FROM files
+        WHERE source_service = 'drive' AND extension IS NOT NULL AND extension != ''
+        GROUP BY extension
+        ORDER BY count DESC
+        LIMIT 20
+    ''').fetchall()
+    return [{'ext': r['extension'], 'count': r['count']} for r in rows]
+
+
+def _format_size(size_bytes):
+    """Format bytes into human-readable size."""
+    if not size_bytes:
+        return '0 B'
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(size_bytes) < 1024:
+            return f'{size_bytes:.1f} {unit}'
+        size_bytes /= 1024
+    return f'{size_bytes:.1f} PB'
+
+
+app.jinja_env.globals['format_size'] = _format_size
+
+
+@app.route('/drive')
+def drive_browser():
+    """Google Drive file browser."""
+    path = request.args.get('path', '')
+    query = request.args.get('q', '')
+    ext = request.args.get('ext', '')
+    page = request.args.get('page', 1, type=int)
+    per_page = 50
+
+    db = get_files_db()
+    use_pi_nas = False
+    files = []
+    total = 0
+    folders = []
+    stats = {'count': 0, 'bytes': 0, 'archives': 0}
+    extensions = []
+
+    if db:
+        # Check if we have Drive data locally
+        drive_count = db.execute(
+            "SELECT COUNT(*) FROM files WHERE source_service = 'drive'"
+        ).fetchone()[0]
+
+        if drive_count > 0:
+            files, total = _query_drive_local(db, path or None, query or None, ext or None, page, per_page)
+            folders = _get_drive_folders(db, path or None)
+            stats = _get_drive_stats(db)
+            extensions = _get_drive_extensions(db)
+        else:
+            use_pi_nas = True
+    else:
+        use_pi_nas = True
+
+    if use_pi_nas:
+        files, total = _query_drive_pi_nas(path or None, query or None, ext or None, page, per_page)
+
+    # Build breadcrumbs
+    breadcrumbs = []
+    if path:
+        parts = path.split('/')
+        for i, part in enumerate(parts):
+            breadcrumbs.append({
+                'name': part,
+                'path': '/'.join(parts[:i + 1])
+            })
+
+    return render_template('drive_browser.html',
+                           files=files,
+                           total=total,
+                           folders=folders,
+                           stats=stats,
+                           extensions=extensions,
+                           breadcrumbs=breadcrumbs,
+                           current_path=path,
+                           query=query,
+                           ext_filter=ext,
+                           page=page,
+                           per_page=per_page,
+                           use_pi_nas=use_pi_nas,
+                           drive_prefix_len=DRIVE_PREFIX_LEN)
+
+
+@app.route('/api/drive/folders')
+def api_drive_folders():
+    """API: Get subfolders for a Drive path."""
+    parent = request.args.get('path', '')
+    db = get_files_db()
+    if not db:
+        return jsonify({'folders': [], 'error': 'No local files DB'}), 200
+
+    folders = _get_drive_folders(db, parent or None)
+    return jsonify({'path': parent, 'folders': folders})
+
+
+@app.route('/api/drive/search')
+def api_drive_search():
+    """API: FTS5 search across Drive files."""
+    query = request.args.get('q', '')
+    ext = request.args.get('ext', '')
+    limit = request.args.get('limit', 50, type=int)
+
+    if not query:
+        return jsonify({'error': 'Query required'}), 400
+
+    db = get_files_db()
+    if not db:
+        return jsonify({'error': 'No local files DB', 'results': []}), 200
+
+    params = [query]
+    ext_clause = ''
+    if ext:
+        ext_clause = ' AND f.extension = ?'
+        params.append(ext)
+
+    results = db.execute(f'''
+        SELECT f.path, f.filename, f.extension, f.size_bytes, f.source_archive
+        FROM files f
+        WHERE f.source_service = 'drive'
+          AND f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)
+          {ext_clause}
+        ORDER BY f.path
+        LIMIT ?
+    ''', params + [limit]).fetchall()
+
+    return jsonify({
+        'query': query,
+        'count': len(results),
+        'results': [dict(r) for r in results]
+    })
 
 
 def main():

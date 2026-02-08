@@ -30,6 +30,10 @@
         <div class="number">{{ stats.transcripts }}</div>
         <div class="label">Transcripts</div>
     </div>
+    <div class="stat-card">
+        <div class="number">{{ "{:,}".format(stats.drive_files) }}</div>
+        <div class="label"><a href="/drive" style="color: inherit;">Drive Files</a></div>
+    </div>
 </div>
 
 <h2>Recent Sessions</h2>
