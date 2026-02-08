@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+Get recent messages from the current or specified Claude session.
+
+Usage:
+    get-messages-from-current              # Last 5 messages from most recent session
+    get-messages-from-current --last 10    # Last 10 messages
+    get-messages-from-current --session abc123-uuid
+    get-messages-from-current --json
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Add lib to path (resolve symlinks to find actual location)
+SCRIPT_PATH = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT_PATH.parent.parent / "lib"))
+from queries import DatalakeQueries
+
+
+def get_current_session_id() -> str | None:
+    """Try to detect the current session from environment or recent sessions."""
+    # Check for CLAUDE_SESSION_ID environment variable
+    import os
+    session_id = os.environ.get("CLAUDE_SESSION_ID")
+    if session_id:
+        return session_id
+
+    # Fall back to most recent session
+    dq = DatalakeQueries()
+    try:
+        sessions = dq.get_recent_sessions(limit=1)
+        if sessions:
+            return sessions[0].session_id
+    finally:
+        dq.close()
+
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Get recent messages from a Claude session",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    get-messages-from-current                    # Last 5 from most recent session
+    get-messages-from-current --last 1          # Just the last message
+    get-messages-from-current --session abc123  # Specific session
+    get-messages-from-current --user-only       # Only user messages
+    get-messages-from-current --json | jq '.[0].content_text'
+"""
+    )
+    parser.add_argument("--session", "-s", help="Session ID (default: most recent)")
+    parser.add_argument("--last", "-n", type=int, default=5, help="Number of messages (default: 5)")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--user-only", action="store_true", help="Only show user messages")
+    parser.add_argument("--assistant-only", action="store_true", help="Only show assistant messages")
+    parser.add_argument("--show-thinking", action="store_true", help="Include thinking content")
+    args = parser.parse_args()
+
+    session_id = args.session or get_current_session_id()
+    if not session_id:
+        print("Error: Could not determine session ID. Use --session to specify.", file=sys.stderr)
+        sys.exit(1)
+
+    dq = DatalakeQueries()
+
+    try:
+        # Determine message type filter
+        message_types = None
+        if args.user_only:
+            message_types = ["user"]
+        elif args.assistant_only:
+            message_types = ["assistant"]
+
+        # Get session metadata
+        session = dq.get_session_metadata(session_id)
+        if not session:
+            print(f"Error: Session not found: {session_id}", file=sys.stderr)
+            sys.exit(1)
+
+        # Get messages (we need to get all and take the last N)
+        all_messages = dq.get_session_messages(
+            session_id=session_id,
+            message_types=message_types,
+        )
+
+        # Take last N messages
+        messages = all_messages[-args.last:] if args.last < len(all_messages) else all_messages
+
+        if args.json:
+            output = {
+                "session": {
+                    "session_id": session.session_id,
+                    "project_path": session.project_path,
+                    "started_at": session.started_at,
+                    "total_messages": session.total_messages,
+                },
+                "messages": [
+                    {
+                        "message_uuid": m.message_uuid,
+                        "type": m.message_type,
+                        "role": m.role,
+                        "content_text": m.content_text,
+                        "content_thinking": m.content_thinking if args.show_thinking else None,
+                        "timestamp": m.timestamp,
+                        "model": m.model,
+                    }
+                    for m in messages
+                ]
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            print(f"\n## Session: {session.session_id[:8]}...")
+            print(f"**Project:** {session.project_path}")
+            print(f"**Started:** {session.started_at}")
+            print(f"**Total Messages:** {session.total_messages}")
+            print(f"**Showing:** last {len(messages)} messages\n")
+
+            for i, m in enumerate(messages, 1):
+                role_display = m.role or m.message_type
+                print(f"---")
+                print(f"**[{role_display.upper()}]** ({m.timestamp})")
+
+                if m.content_text:
+                    # Truncate long messages for display
+                    text = m.content_text
+                    if len(text) > 500:
+                        text = text[:500] + "...[truncated]"
+                    print(text)
+
+                if args.show_thinking and m.content_thinking:
+                    print(f"\n<thinking>")
+                    thinking = m.content_thinking[:300] + "..." if len(m.content_thinking) > 300 else m.content_thinking
+                    print(thinking)
+                    print(f"</thinking>")
+
+                print()
+
+    finally:
+        dq.close()
+
+
+if __name__ == "__main__":
+    main()
