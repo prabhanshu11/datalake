@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""
+Find Claude conversations by keyword with date filtering.
+
+Usage:
+    find-conversations "star trek"
+    find-conversations "tapo" --since 2026-01-01
+    find-conversations "datalake" --json
+    find-conversations "git" --project Programs --limit 5
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Add lib to path (resolve symlinks to find actual location)
+SCRIPT_PATH = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT_PATH.parent.parent / "lib"))
+from queries import DatalakeQueries
+
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    return f"{hours}h {mins}m"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find Claude conversations by keyword",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    find-conversations "tapo camera"
+    find-conversations "git" --since 2026-01-10 --limit 5
+    find-conversations "datalake" --json | jq '.[] | .session_id'
+"""
+    )
+    parser.add_argument("query", help="Search query (FTS5 syntax supported)")
+    parser.add_argument("--since", help="Only sessions after this date (YYYY-MM-DD)")
+    parser.add_argument("--until", help="Only sessions before this date (YYYY-MM-DD)")
+    parser.add_argument("--project", help="Filter by project path (partial match)")
+    parser.add_argument("--limit", "-n", type=int, default=20, help="Max results (default: 20)")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--history-only", action="store_true",
+                        help="Search only user prompts, not full messages")
+    args = parser.parse_args()
+
+    dq = DatalakeQueries()
+
+    try:
+        sessions = dq.search_conversations(
+            query=args.query,
+            limit=args.limit,
+            since=args.since,
+            until=args.until,
+            project=args.project,
+            search_messages=not args.history_only,
+        )
+
+        if args.json:
+            output = [
+                {
+                    "session_id": s.session_id,
+                    "project_path": s.project_path,
+                    "started_at": s.started_at,
+                    "ended_at": s.ended_at,
+                    "summary": s.summary,
+                    "total_messages": s.total_messages,
+                    "model": s.model_primary,
+                    "source_device": s.source_device,
+                    "duration_seconds": s.duration_seconds,
+                    "resume_command": f"claude --resume {s.session_id}",
+                }
+                for s in sessions
+            ]
+            print(json.dumps(output, indent=2))
+        else:
+            if not sessions:
+                print(f"No conversations found for '{args.query}'")
+                return
+
+            print(f"\n## Found {len(sessions)} conversations about '{args.query}'\n")
+
+            for i, s in enumerate(sessions, 1):
+                print(f"---")
+                print(f"**{i}. Session:** {s.session_id}")
+                print(f"**Date:** {s.started_at}")
+                print(f"**Project:** {s.project_path}")
+                print(f"**Messages:** {s.total_messages} | **Duration:** {format_duration(s.duration_seconds)}")
+                if s.summary:
+                    print(f"**Summary:** {s.summary[:200]}...")
+                print(f"\n**Resume:**")
+                print(f"```bash")
+                print(f"claude --resume {s.session_id}")
+                print(f"```\n")
+
+    finally:
+        dq.close()
+
+
+if __name__ == "__main__":
+    main()
