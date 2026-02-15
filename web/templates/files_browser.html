@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Drive Browser - Datalake{% endblock %}
+{% block title %}Files Browser - Datalake{% endblock %}
 
 {% block content %}
 <style>
@@ -83,10 +83,45 @@
     }
     .ext-chip:hover { background: #30363d; color: #c9d1d9; }
     .ext-chip.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+    .service-tabs {
+        display: flex;
+        gap: 0.35rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+    }
+    .service-tab {
+        display: inline-block;
+        padding: 0.3rem 0.75rem;
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        font-size: 0.8rem;
+        color: #8b949e;
+        text-decoration: none;
+    }
+    .service-tab:hover { background: #30363d; color: #c9d1d9; }
+    .service-tab.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+    .service-tab .count { opacity: 0.7; font-size: 0.75rem; }
     .file-path {
         color: #8b949e;
         font-size: 0.8rem;
     }
+    .service-badge {
+        display: inline-block;
+        padding: 0.1rem 0.4rem;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: capitalize;
+    }
+    .service-badge.photos { background: #238636; }
+    .service-badge.drive { background: #1f6feb; }
+    .service-badge.mail { background: #f0883e; color: #0d1117; }
+    .service-badge.keep { background: #f0e68c; color: #0d1117; }
+    .service-badge.contacts { background: #8b5cf6; }
+    .service-badge.calendar { background: #06b6d4; }
+    .service-badge.chrome { background: #da3633; }
+    .service-badge.youtube { background: #ff0000; }
     .no-data-banner {
         background: #1c2128;
         border: 2px dashed #30363d;
@@ -123,13 +158,17 @@
     }
 </style>
 
-<h1>Google Drive Files</h1>
+<h1>Files{% if current_service %} - {{ current_service|capitalize }}{% endif %}
+{% if current_service == 'photos' %}
+    <a href="/files/photos" style="font-size: 0.9rem; margin-left: 1rem; padding: 0.4rem 0.8rem; background: #238636; border-radius: 6px; color: white; text-decoration: none; font-weight: normal;">Open Photo Browser</a>
+{% endif %}
+</h1>
 
 {% if stats.count > 0 %}
 <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 1.5rem;">
     <div class="stat-card">
         <div class="number">{{ "{:,}".format(stats.count) }}</div>
-        <div class="label">Files</div>
+        <div class="label">Files{% if current_service %} ({{ current_service }}){% endif %}</div>
     </div>
     <div class="stat-card">
         <div class="number">{{ format_size(stats.bytes) }}</div>
@@ -141,22 +180,39 @@
     </div>
 </div>
 
+<!-- Service filter tabs -->
+{% if service_stats %}
+<div class="service-tabs">
+    <a href="/files" class="service-tab {% if not current_service %}active{% endif %}">
+        All <span class="count">({{ "{:,}".format(service_stats.values()|sum(attribute='count')) }})</span>
+    </a>
+    {% for svc, svc_stats in service_stats.items() %}
+    <a href="/files?service={{ svc }}" class="service-tab {% if current_service == svc %}active{% endif %}">
+        {{ svc|capitalize }} <span class="count">({{ "{:,}".format(svc_stats.count) }})</span>
+    </a>
+    {% endfor %}
+</div>
+{% endif %}
+
 {% if use_pi_nas %}
-<p style="margin-bottom: 1rem;"><span class="pi-nas-badge">Pi NAS</span> Querying files from Pi NAS (no local Drive data)</p>
+<p style="margin-bottom: 1rem;"><span class="pi-nas-badge">Pi NAS</span> Querying files from Pi NAS (no local data)</p>
 {% endif %}
 
 <!-- Search + filter bar -->
-<form method="get" action="/drive" class="filter-bar">
+<form method="get" action="/files" class="filter-bar">
+    {% if current_service %}
+    <input type="hidden" name="service" value="{{ current_service }}">
+    {% endif %}
     {% if current_path %}
     <input type="hidden" name="path" value="{{ current_path }}">
     {% endif %}
-    <input type="text" name="q" value="{{ query }}" placeholder="Search Drive files...">
+    <input type="text" name="q" value="{{ query }}" placeholder="Search files...">
     {% if ext_filter %}
     <input type="hidden" name="ext" value="{{ ext_filter }}">
     {% endif %}
     <button type="submit">Search</button>
     {% if query or ext_filter %}
-    <a href="/drive{% if current_path %}?path={{ current_path }}{% endif %}" style="padding: 0.5rem; font-size: 0.9rem;">Clear</a>
+    <a href="/files{% if current_service %}?service={{ current_service }}{% endif %}{% if current_path %}{% if current_service %}&{% else %}?{% endif %}path={{ current_path }}{% endif %}" style="padding: 0.5rem; font-size: 0.9rem;">Clear</a>
     {% endif %}
 </form>
 
@@ -164,7 +220,7 @@
 {% if extensions %}
 <div class="ext-chips">
     {% for e in extensions %}
-    <a href="/drive?{% if current_path %}path={{ current_path }}&{% endif %}{% if query %}q={{ query }}&{% endif %}ext={{ e.ext }}"
+    <a href="/files?{% if current_service %}service={{ current_service }}&{% endif %}{% if current_path %}path={{ current_path }}&{% endif %}{% if query %}q={{ query }}&{% endif %}ext={{ e.ext }}"
        class="ext-chip {% if ext_filter == e.ext %}active{% endif %}">
         {{ e.ext }} ({{ e.count }})
     </a>
@@ -174,10 +230,10 @@
 
 <!-- Breadcrumb -->
 <div class="breadcrumb">
-    <a href="/drive">Drive</a>
+    <a href="/files{% if current_service %}?service={{ current_service }}{% endif %}">{% if current_service %}{{ current_service|capitalize }}{% else %}Files{% endif %}</a>
     {% for bc in breadcrumbs %}
     <span class="sep">/</span>
-    <a href="/drive?path={{ bc.path }}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}">{{ bc.name }}</a>
+    <a href="/files?{% if current_service %}service={{ current_service }}&{% endif %}path={{ bc.path }}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}">{{ bc.name }}</a>
     {% endfor %}
 </div>
 
@@ -186,10 +242,10 @@
     <div class="folder-sidebar">
         <div style="font-weight: 600; margin-bottom: 0.5rem; color: #8b949e; font-size: 0.8rem;">FOLDERS</div>
         {% if current_path %}
-        <a href="/drive{% if '/' in current_path %}?path={{ current_path.rsplit('/', 1)[0] }}{% endif %}">.. (up)</a>
+        <a href="/files{% if current_service %}?service={{ current_service }}{% endif %}{% if '/' in current_path %}{% if current_service %}&{% else %}?{% endif %}path={{ current_path.rsplit('/', 1)[0] }}{% endif %}">.. (up)</a>
         {% endif %}
         {% for folder in folders %}
-        <a href="/drive?path={% if current_path %}{{ current_path }}/{% endif %}{{ folder }}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}"
+        <a href="/files?{% if current_service %}service={{ current_service }}&{% endif %}path={% if current_path %}{{ current_path }}/{% endif %}{{ folder }}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}"
            {% if current_path and current_path.endswith(folder) %}class="active"{% endif %}>
             {{ folder }}
         </a>
@@ -213,6 +269,7 @@
                     <th>Name</th>
                     <th>Size</th>
                     <th>Type</th>
+                    {% if not current_service %}<th>Service</th>{% endif %}
                     <th>Archive</th>
                 </tr>
             </thead>
@@ -222,15 +279,21 @@
                     <td>
                         {% if f is mapping %}
                             {{ f.filename }}
-                            {% set rel_path = f.path[drive_prefix_len:] if f.path|length > drive_prefix_len else f.path %}
+                            {% set rel_path = f.path[path_prefix_len:] if f.path|length > path_prefix_len else f.path %}
                         {% else %}
                             {{ f['filename'] }}
-                            {% set rel_path = f['path'][drive_prefix_len:] if f['path']|length > drive_prefix_len else f['path'] %}
+                            {% set rel_path = f['path'][path_prefix_len:] if f['path']|length > path_prefix_len else f['path'] %}
                         {% endif %}
                         <div class="file-path">{{ rel_path }}</div>
                     </td>
                     <td>{{ format_size(f['size_bytes'] if f is mapping else f.size_bytes) }}</td>
                     <td>{{ (f['extension'] if f is mapping else f.extension) or '-' }}</td>
+                    {% if not current_service %}
+                    <td>
+                        {% set svc = (f['source_service'] if f is mapping else f.source_service) or '' %}
+                        <span class="service-badge {{ svc }}">{{ svc }}</span>
+                    </td>
+                    {% endif %}
                     <td class="file-path">{{ ((f['source_archive'] if f is mapping else f.source_archive) or '')|replace('takeout-20260126T191854Z-', '') }}</td>
                 </tr>
                 {% endfor %}
@@ -240,11 +303,11 @@
         <!-- Pagination -->
         <div class="pagination" style="margin-top: 1rem;">
             {% if page > 1 %}
-            <a href="/drive?page={{ page - 1 }}{% if current_path %}&path={{ current_path }}{% endif %}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}">Previous</a>
+            <a href="/files?page={{ page - 1 }}{% if current_service %}&service={{ current_service }}{% endif %}{% if current_path %}&path={{ current_path }}{% endif %}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}">Previous</a>
             {% endif %}
             <span style="padding: 0.5rem;">Page {{ page }} of {{ ((total - 1) // per_page) + 1 }}</span>
             {% if files|length == per_page %}
-            <a href="/drive?page={{ page + 1 }}{% if current_path %}&path={{ current_path }}{% endif %}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}">Next</a>
+            <a href="/files?page={{ page + 1 }}{% if current_service %}&service={{ current_service }}{% endif %}{% if current_path %}&path={{ current_path }}{% endif %}{% if query %}&q={{ query }}{% endif %}{% if ext_filter %}&ext={{ ext_filter }}{% endif %}">Next</a>
             {% endif %}
         </div>
         {% else %}
@@ -256,18 +319,17 @@
 {% else %}
 <!-- No data state -->
 <div class="no-data-banner">
-    <h3>No Drive Files Indexed</h3>
+    <h3>No Files Indexed</h3>
     <p style="color: #8b949e; margin-bottom: 1rem;">
-        Index your Google Takeout Drive exports to browse files here.
+        Index your Google Takeout exports to browse files here.
     </p>
-    <p style="color: #8b949e;">The Drive zips contain ~12,144 files (66 GB) from your Google Drive export.</p>
+    <p style="color: #8b949e;">Google Takeout archives contain Drive, Photos, Mail, and other services (~43K files, 328 GB total).</p>
     <pre>
-# Index Drive zips into local-index.db:
+# Index Takeout zips into local-index.db:
 cd ~/Programs/takeout-parser
 
-# After rsyncing zips to this machine:
-python takeout_parser.py index ~/path/to/takeout-*-15-001.zip --db local-index.db
-python takeout_parser.py index ~/path/to/takeout-*-15-002.zip --db local-index.db
+# Index specific archives:
+python takeout_parser.py index ~/path/to/takeout-*.zip --db local-index.db
 
 # OR index on Pi NAS directly:
 ssh pi5 "cd /home/pi/Programs/takeout-parser && python3 takeout_parser.py scan /mnt/nas/t7/takeout-archives/"

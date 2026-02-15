@@ -1,0 +1,369 @@
+{% extends "base.html" %}
+
+{% block title %}Photo Browser - Datalake{% endblock %}
+
+{% block content %}
+<style>
+    .year-chips, .month-chips, .view-tabs {
+        display: flex;
+        gap: 0.35rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+    }
+    .chip {
+        display: inline-block;
+        padding: 0.3rem 0.7rem;
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        font-size: 0.8rem;
+        color: #8b949e;
+        text-decoration: none;
+        cursor: pointer;
+    }
+    .chip:hover { background: #30363d; color: #c9d1d9; }
+    .chip.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+    .chip.disabled { opacity: 0.3; pointer-events: none; }
+    .chip .count { opacity: 0.7; font-size: 0.7rem; margin-left: 0.2rem; }
+    .view-tab { padding: 0.4rem 1rem; font-size: 0.85rem; }
+    .view-tab.active { background: #238636; border-color: #238636; }
+
+    .photo-grid {
+        width: 100%;
+        border-collapse: collapse;
+        background: #161b22;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+    .photo-grid th, .photo-grid td {
+        padding: 0.5rem 0.75rem;
+        text-align: left;
+        border-bottom: 1px solid #30363d;
+        font-size: 0.85rem;
+    }
+    .photo-grid th { background: #21262d; font-weight: 600; font-size: 0.8rem; color: #8b949e; }
+    .photo-grid tr:hover { background: #21262d; }
+
+    .file-cell { min-width: 140px; }
+    .file-cell .fname { color: #c9d1d9; word-break: break-all; }
+    .file-cell .fsize { color: #8b949e; font-size: 0.75rem; }
+    .file-cell .farchive { color: #484f58; font-size: 0.7rem; }
+    .empty-cell { color: #30363d; font-style: italic; font-size: 0.8rem; }
+
+    .extract-btn {
+        padding: 0.2rem 0.5rem;
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        color: #58a6ff;
+        cursor: pointer;
+        font-size: 0.75rem;
+    }
+    .extract-btn:hover { background: #30363d; }
+    .extract-btn.extracting { color: #f0883e; cursor: wait; }
+    .extract-btn.done { color: #3fb950; border-color: #238636; }
+    .extracted-badge {
+        color: #3fb950;
+        font-size: 0.75rem;
+    }
+
+    .data-source-badge {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        margin-left: 0.5rem;
+    }
+    .data-source-badge.pi-nas { background: #f0883e20; border: 1px solid #f0883e; color: #f0883e; }
+    .data-source-badge.local { background: #3fb95020; border: 1px solid #3fb950; color: #3fb950; }
+
+    .json-cell { max-width: 200px; }
+    .json-info { color: #8b949e; font-size: 0.75rem; }
+    .json-info .jname { color: #c9d1d9; word-break: break-all; font-size: 0.7rem; }
+
+    .section-label {
+        font-weight: 600;
+        color: #8b949e;
+        font-size: 0.8rem;
+        margin-bottom: 0.35rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    @media (max-width: 768px) {
+        .photo-grid { font-size: 0.75rem; }
+        .photo-grid th, .photo-grid td { padding: 0.35rem 0.5rem; }
+    }
+</style>
+
+<h1>Photo Browser
+    <span class="data-source-badge {{ data_source }}">{{ data_source|upper }}</span>
+</h1>
+
+{% if not pi_reachable and data_source == 'local' %}
+<div style="background: #f0883e15; border: 1px solid #f0883e40; border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.85rem;">
+    Pi NAS unreachable - showing local data only (may be incomplete: local has 2/5 photo archives)
+</div>
+{% endif %}
+
+<!-- Year selector -->
+<div class="section-label">Year</div>
+<div class="year-chips">
+    {% for y in years %}
+    <a href="/files/photos?year={{ y.year }}&view={{ current_view }}"
+       class="chip {% if current_year == y.year %}active{% endif %}">
+        {{ y.year }} <span class="count">({{ y.count }})</span>
+    </a>
+    {% endfor %}
+</div>
+
+<!-- Month selector -->
+<div class="section-label">Month</div>
+<div class="month-chips">
+    <a href="/files/photos?year={{ current_year }}&view={{ current_view }}"
+       class="chip {% if not current_month %}active{% endif %}">All</a>
+    {% set month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] %}
+    {% for m in range(1, 13) %}
+    {% set mcount = month_counts.get(m, 0) %}
+    <a href="/files/photos?year={{ current_year }}&month={{ m }}&view={{ current_view }}"
+       class="chip {% if current_month == m %}active{% endif %} {% if mcount == 0 %}disabled{% endif %}">
+        {{ month_names[m-1] }} <span class="count">({{ mcount }})</span>
+    </a>
+    {% endfor %}
+</div>
+
+<!-- View tabs -->
+<div class="view-tabs">
+    <a href="/files/photos?year={{ current_year }}{% if current_month %}&month={{ current_month }}{% endif %}&view=photos"
+       class="chip view-tab {% if current_view == 'photos' %}active{% endif %}">
+        Photos <span class="count">({{ view_counts.photos }})</span>
+    </a>
+    <a href="/files/photos?year={{ current_year }}{% if current_month %}&month={{ current_month }}{% endif %}&view=videos"
+       class="chip view-tab {% if current_view == 'videos' %}active{% endif %}">
+        Videos <span class="count">({{ view_counts.videos }})</span>
+    </a>
+    <a href="/files/photos?year={{ current_year }}{% if current_month %}&month={{ current_month }}{% endif %}&view=other"
+       class="chip view-tab {% if current_view == 'other' %}active{% endif %}">
+        Other
+    </a>
+</div>
+
+<div style="margin-bottom: 0.5rem; color: #8b949e; font-size: 0.85rem;">
+    {{ total }} items
+    {% if current_month %} in {{ month_names[current_month-1] }} {{ current_year }}{% else %} in {{ current_year }}{% endif %}
+    &middot; Page {{ page }} of {{ ((total - 1) // per_page) + 1 if total > 0 else 1 }}
+</div>
+
+{% if current_view == 'photos' %}
+<!-- Photos view: JPG + RAW + JSON paired -->
+{% if paired %}
+<table class="photo-grid">
+    <thead>
+        <tr>
+            <th>JPG / Image</th>
+            <th>RAW</th>
+            <th>JSON Metadata</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in paired %}
+        <tr>
+            <!-- JPG column -->
+            <td class="file-cell">
+                {% if row.jpg %}
+                <div class="fname">{{ row.jpg.filename }}</div>
+                <div class="fsize">{{ format_size(row.jpg.size_bytes) }}</div>
+                <div class="farchive">{{ row.jpg.source_archive|replace('takeout-20260126T191854Z-', '') }}</div>
+                {% if row.jpg.extracted %}
+                    <span class="extracted-badge">&#10003; extracted</span>
+                {% else %}
+                    <button class="extract-btn" onclick="extractFile(this, '{{ row.jpg.path }}', '{{ row.jpg.source_archive }}')">Extract</button>
+                {% endif %}
+                {% else %}
+                <span class="empty-cell">(no image)</span>
+                {% endif %}
+            </td>
+            <!-- RAW column -->
+            <td class="file-cell">
+                {% if row.raw %}
+                <div class="fname">{{ row.raw.filename }}</div>
+                <div class="fsize">{{ format_size(row.raw.size_bytes) }}</div>
+                <div class="farchive">{{ row.raw.source_archive|replace('takeout-20260126T191854Z-', '') }}</div>
+                {% if row.raw.extracted %}
+                    <span class="extracted-badge">&#10003; extracted</span>
+                {% else %}
+                    <button class="extract-btn" onclick="extractFile(this, '{{ row.raw.path }}', '{{ row.raw.source_archive }}')">Extract</button>
+                {% endif %}
+                {% else %}
+                <span class="empty-cell">(no RAW)</span>
+                {% endif %}
+            </td>
+            <!-- JSON column -->
+            <td class="json-cell">
+                {% if row.json %}
+                {% for j in row.json %}
+                <div class="json-info">
+                    <div class="jname">{{ j.filename }}</div>
+                    <div>{{ format_size(j.size_bytes) }}</div>
+                    {% if j.extracted %}
+                        <span class="extracted-badge">&#10003;</span>
+                    {% else %}
+                        <button class="extract-btn" onclick="extractFile(this, '{{ j.path }}', '{{ j.source_archive }}')">Extract</button>
+                    {% endif %}
+                </div>
+                {% endfor %}
+                {% else %}
+                <span class="empty-cell">-</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p style="color: #8b949e; padding: 2rem; text-align: center;">No photos found for this selection.</p>
+{% endif %}
+
+{% elif current_view == 'videos' %}
+<!-- Videos view: Video + JSON paired -->
+{% if paired %}
+<table class="photo-grid">
+    <thead>
+        <tr>
+            <th>Video</th>
+            <th>Size</th>
+            <th>JSON Metadata</th>
+            <th>Archive</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in paired %}
+        {% if row.video %}
+        <tr>
+            <td class="file-cell">
+                <div class="fname">{{ row.video.filename }}</div>
+            </td>
+            <td>{{ format_size(row.video.size_bytes) }}</td>
+            <td class="json-cell">
+                {% if row.json %}
+                {% for j in row.json %}
+                <div class="json-info">
+                    <div class="jname">{{ j.filename }}</div>
+                    <div>{{ format_size(j.size_bytes) }}
+                    {% if j.extracted %}
+                        <span class="extracted-badge">&#10003;</span>
+                    {% else %}
+                        <button class="extract-btn" onclick="extractFile(this, '{{ j.path }}', '{{ j.source_archive }}')">Extract</button>
+                    {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+                {% else %}
+                <span class="empty-cell">-</span>
+                {% endif %}
+            </td>
+            <td class="file-cell">
+                <div class="farchive">{{ row.video.source_archive|replace('takeout-20260126T191854Z-', '') }}</div>
+            </td>
+            <td>
+                {% if row.video.extracted %}
+                    <span class="extracted-badge">&#10003; extracted</span>
+                {% else %}
+                    <button class="extract-btn" onclick="extractFile(this, '{{ row.video.path }}', '{{ row.video.source_archive }}')">Extract</button>
+                {% endif %}
+            </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p style="color: #8b949e; padding: 2rem; text-align: center;">No videos found for this selection.</p>
+{% endif %}
+
+{% else %}
+<!-- Other view: simple file list -->
+{% if paired %}
+<table class="photo-grid">
+    <thead>
+        <tr>
+            <th>Filename</th>
+            <th>Size</th>
+            <th>Type</th>
+            <th>Archive</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in paired %}
+        {% set f = row.jpg %}
+        {% if f %}
+        <tr>
+            <td class="file-cell"><div class="fname">{{ f.filename }}</div></td>
+            <td>{{ format_size(f.size_bytes) }}</td>
+            <td>{{ f.extension }}</td>
+            <td class="file-cell"><div class="farchive">{{ f.source_archive|replace('takeout-20260126T191854Z-', '') }}</div></td>
+            <td>
+                {% if f.extracted %}
+                    <span class="extracted-badge">&#10003; extracted</span>
+                {% else %}
+                    <button class="extract-btn" onclick="extractFile(this, '{{ f.path }}', '{{ f.source_archive }}')">Extract</button>
+                {% endif %}
+            </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p style="color: #8b949e; padding: 2rem; text-align: center;">No other files found for this selection.</p>
+{% endif %}
+{% endif %}
+
+<!-- Pagination -->
+{% if total > per_page %}
+<div class="pagination" style="margin-top: 1rem;">
+    {% if page > 1 %}
+    <a href="/files/photos?year={{ current_year }}&view={{ current_view }}{% if current_month %}&month={{ current_month }}{% endif %}&page={{ page - 1 }}">Previous</a>
+    {% endif %}
+    <span style="padding: 0.5rem;">Page {{ page }} of {{ ((total - 1) // per_page) + 1 }}</span>
+    {% if paired|length == per_page %}
+    <a href="/files/photos?year={{ current_year }}&view={{ current_view }}{% if current_month %}&month={{ current_month }}{% endif %}&page={{ page + 1 }}">Next</a>
+    {% endif %}
+</div>
+{% endif %}
+
+<script>
+function extractFile(btn, path, archive) {
+    btn.classList.add('extracting');
+    btn.textContent = 'Extracting...';
+    btn.disabled = true;
+
+    fetch('/api/files/extract', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: path, archive: archive})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            btn.classList.remove('extracting');
+            btn.classList.add('done');
+            btn.textContent = '\u2713 Extracted';
+        } else {
+            btn.classList.remove('extracting');
+            btn.textContent = 'Failed: ' + (data.error || 'unknown');
+            btn.disabled = false;
+        }
+    })
+    .catch(err => {
+        btn.classList.remove('extracting');
+        btn.textContent = 'Error';
+        btn.disabled = false;
+        console.error('Extract error:', err);
+    });
+}
+</script>
+
+{% endblock %}

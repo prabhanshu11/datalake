@@ -85,18 +85,18 @@ def index():
         'transcripts': db.execute('SELECT COUNT(*) FROM transcripts').fetchone()[0],
     }
 
-    # Drive files stats from local files DB
+    # Files stats from local files DB (all services)
     files_db = get_files_db()
     if files_db:
         try:
-            drive_row = files_db.execute(
-                "SELECT COUNT(*) FROM files WHERE source_service = 'drive'"
+            files_row = files_db.execute(
+                "SELECT COUNT(*) FROM files"
             ).fetchone()
-            stats['drive_files'] = drive_row[0] if drive_row else 0
+            stats['total_files'] = files_row[0] if files_row else 0
         except Exception:
-            stats['drive_files'] = 0
+            stats['total_files'] = 0
     else:
-        stats['drive_files'] = 0
+        stats['total_files'] = 0
 
     # Recent sessions
     recent = db.execute('''
@@ -1181,17 +1181,42 @@ def api_pi_nas_search():
 
 
 # =============================================================================
-# Google Drive Browser Routes
+# Files Browser Routes (all Google Takeout services)
 # =============================================================================
 
-DRIVE_PATH_PREFIX = 'Takeout/Drive/'
-DRIVE_PREFIX_LEN = len(DRIVE_PATH_PREFIX)
+# Path prefix per service for folder navigation
+SERVICE_PATH_PREFIXES = {
+    'drive': 'Takeout/Drive/',
+    'photos': 'Takeout/Google Photos/',
+    'mail': 'Takeout/Mail/',
+    'keep': 'Takeout/Keep/',
+    'contacts': 'Takeout/Contacts/',
+    'calendar': 'Takeout/Calendar/',
+    'chrome': 'Takeout/Chrome/',
+    'maps': 'Takeout/Maps/',
+    'youtube': 'Takeout/YouTube and YouTube Music/',
+    'hangouts': 'Takeout/Hangouts/',
+    'fit': 'Takeout/Fit/',
+    'tasks': 'Takeout/Tasks/',
+    'profile': 'Takeout/Profile/',
+}
 
 
-def _query_drive_local(db, path=None, query=None, ext=None, page=1, per_page=50):
-    """Query Drive files from local files DB."""
+def _get_path_prefix(service=None):
+    """Get the path prefix for a given service (or generic Takeout/ for all)."""
+    if service and service in SERVICE_PATH_PREFIXES:
+        return SERVICE_PATH_PREFIXES[service]
+    return 'Takeout/'
+
+
+def _query_files_local(db, service=None, path=None, query=None, ext=None, page=1, per_page=50):
+    """Query files from local files DB, optionally filtered by service."""
     params = []
-    where_clauses = ["f.source_service = 'drive'"]
+    where_clauses = []
+
+    if service:
+        where_clauses.append("f.source_service = ?")
+        params.append(service)
 
     if query:
         where_clauses.append(
@@ -1200,14 +1225,15 @@ def _query_drive_local(db, path=None, query=None, ext=None, page=1, per_page=50)
         params.append(query)
 
     if path:
+        prefix = _get_path_prefix(service)
         where_clauses.append("f.path LIKE ?")
-        params.append(f'{DRIVE_PATH_PREFIX}{path}/%')
+        params.append(f'{prefix}{path}/%')
 
     if ext:
         where_clauses.append("f.extension = ?")
         params.append(ext)
 
-    where_sql = ' AND '.join(where_clauses)
+    where_sql = ' AND '.join(where_clauses) if where_clauses else '1=1'
     offset = (page - 1) * per_page
 
     total = db.execute(
@@ -1216,7 +1242,7 @@ def _query_drive_local(db, path=None, query=None, ext=None, page=1, per_page=50)
 
     files = db.execute(f'''
         SELECT f.path, f.filename, f.extension, f.size_bytes,
-               f.source_archive, f.created_at, f.modified_at
+               f.source_service, f.source_archive, f.created_at, f.modified_at
         FROM files f
         WHERE {where_sql}
         ORDER BY f.path
@@ -1226,25 +1252,28 @@ def _query_drive_local(db, path=None, query=None, ext=None, page=1, per_page=50)
     return files, total
 
 
-def _query_drive_pi_nas(path=None, query=None, ext=None, page=1, per_page=50):
-    """Fallback: query Drive files from Pi NAS via SSH."""
+def _query_files_pi_nas(service=None, path=None, query=None, ext=None, page=1, per_page=50):
+    """Fallback: query files from Pi NAS via SSH."""
     import subprocess
 
     pi_ssh = NODES['pi-nas']['ssh_alias']
     if not check_node_reachable(pi_ssh, use_ssh=True):
         return [], 0
 
-    params_parts = ["source_service = 'drive'"]
+    params_parts = []
+    if service:
+        params_parts.append(f"source_service = '{service}'")
     if query:
         params_parts.append(
             f"id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH '{query}')"
         )
     if path:
-        params_parts.append(f"path LIKE '{DRIVE_PATH_PREFIX}{path}/%'")
+        prefix = _get_path_prefix(service)
+        params_parts.append(f"path LIKE '{prefix}{path}/%'")
     if ext:
         params_parts.append(f"extension = '{ext}'")
 
-    where_sql = ' AND '.join(params_parts)
+    where_sql = ' AND '.join(params_parts) if params_parts else '1=1'
     offset = (page - 1) * per_page
 
     # Get count
@@ -1260,7 +1289,7 @@ def _query_drive_pi_nas(path=None, query=None, ext=None, page=1, per_page=50):
         return [], 0
 
     # Get files
-    files_sql = f"""SELECT path, filename, extension, size_bytes, source_archive, created_at, modified_at
+    files_sql = f"""SELECT path, filename, extension, size_bytes, source_service, source_archive, created_at, modified_at
         FROM files WHERE {where_sql} ORDER BY path LIMIT {per_page} OFFSET {offset};"""
     try:
         proc = subprocess.run(
@@ -1272,49 +1301,63 @@ def _query_drive_pi_nas(path=None, query=None, ext=None, page=1, per_page=50):
         if proc.returncode == 0 and proc.stdout.strip():
             for line in proc.stdout.strip().split('\n'):
                 parts = line.split('|')
-                if len(parts) >= 7:
+                if len(parts) >= 8:
                     files.append({
                         'path': parts[0],
                         'filename': parts[1],
                         'extension': parts[2],
                         'size_bytes': int(parts[3]) if parts[3] else 0,
-                        'source_archive': parts[4],
-                        'created_at': parts[5],
-                        'modified_at': parts[6],
+                        'source_service': parts[4],
+                        'source_archive': parts[5],
+                        'created_at': parts[6],
+                        'modified_at': parts[7],
                     })
         return files, total
     except Exception:
         return [], 0
 
 
-def _get_drive_folders(db, parent_path=None):
-    """Get immediate subfolders under a Drive path."""
+def _get_file_folders(db, service=None, parent_path=None):
+    """Get immediate subfolders under a path, optionally filtered by service."""
+    prefix = _get_path_prefix(service)
     if parent_path:
-        prefix = f'{DRIVE_PATH_PREFIX}{parent_path}/'
-    else:
-        prefix = DRIVE_PATH_PREFIX
+        prefix = f'{prefix}{parent_path}/'
 
     prefix_len = len(prefix)
 
-    rows = db.execute('''
+    where_clauses = ["path LIKE ?", "INSTR(SUBSTR(path, ?), '/') > 0"]
+    params = [f'{prefix}%', prefix_len + 1]
+
+    if service:
+        where_clauses.append("source_service = ?")
+        params.append(service)
+
+    where_sql = ' AND '.join(where_clauses)
+
+    rows = db.execute(f'''
         SELECT DISTINCT SUBSTR(path, ?, INSTR(SUBSTR(path, ?), '/') - 1) as folder
         FROM files
-        WHERE source_service = 'drive'
-          AND path LIKE ?
-          AND INSTR(SUBSTR(path, ?), '/') > 0
+        WHERE {where_sql}
         ORDER BY folder
-    ''', (prefix_len + 1, prefix_len + 1, f'{prefix}%', prefix_len + 1)).fetchall()
+    ''', [prefix_len + 1, prefix_len + 1] + params).fetchall()
 
     return [r['folder'] for r in rows if r['folder']]
 
 
-def _get_drive_stats(db):
-    """Get Drive file stats from local DB."""
-    row = db.execute('''
-        SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as bytes,
-               COUNT(DISTINCT source_archive) as archives
-        FROM files WHERE source_service = 'drive'
-    ''').fetchone()
+def _get_file_stats(db, service=None):
+    """Get file stats from local DB, optionally filtered by service."""
+    if service:
+        row = db.execute('''
+            SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as bytes,
+                   COUNT(DISTINCT source_archive) as archives
+            FROM files WHERE source_service = ?
+        ''', (service,)).fetchone()
+    else:
+        row = db.execute('''
+            SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as bytes,
+                   COUNT(DISTINCT source_archive) as archives
+            FROM files
+        ''').fetchone()
     return {
         'count': row['count'],
         'bytes': row['bytes'],
@@ -1322,17 +1365,38 @@ def _get_drive_stats(db):
     }
 
 
-def _get_drive_extensions(db):
-    """Get top file extensions for Drive files."""
-    rows = db.execute('''
-        SELECT extension, COUNT(*) as count
-        FROM files
-        WHERE source_service = 'drive' AND extension IS NOT NULL AND extension != ''
-        GROUP BY extension
-        ORDER BY count DESC
-        LIMIT 20
-    ''').fetchall()
+def _get_file_extensions(db, service=None):
+    """Get top file extensions, optionally filtered by service."""
+    if service:
+        rows = db.execute('''
+            SELECT extension, COUNT(*) as count
+            FROM files
+            WHERE source_service = ? AND extension IS NOT NULL AND extension != ''
+            GROUP BY extension
+            ORDER BY count DESC
+            LIMIT 20
+        ''', (service,)).fetchall()
+    else:
+        rows = db.execute('''
+            SELECT extension, COUNT(*) as count
+            FROM files
+            WHERE extension IS NOT NULL AND extension != ''
+            GROUP BY extension
+            ORDER BY count DESC
+            LIMIT 20
+        ''').fetchall()
     return [{'ext': r['extension'], 'count': r['count']} for r in rows]
+
+
+def _get_service_stats(db):
+    """Get per-service file count and bytes breakdown."""
+    rows = db.execute('''
+        SELECT source_service, COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as bytes
+        FROM files
+        GROUP BY source_service
+        ORDER BY count DESC
+    ''').fetchall()
+    return {r['source_service']: {'count': r['count'], 'bytes': r['bytes']} for r in rows}
 
 
 def _format_size(size_bytes):
@@ -1350,8 +1414,18 @@ app.jinja_env.globals['format_size'] = _format_size
 
 
 @app.route('/drive')
-def drive_browser():
-    """Google Drive file browser."""
+def drive_redirect():
+    """Redirect /drive to /files?service=drive for backwards compatibility."""
+    from flask import redirect, url_for
+    args = request.args.to_dict()
+    args['service'] = 'drive'
+    return redirect(url_for('files_browser', **args))
+
+
+@app.route('/files')
+def files_browser():
+    """File browser for all Google Takeout services."""
+    service = request.args.get('service', '')
     path = request.args.get('path', '')
     query = request.args.get('q', '')
     ext = request.args.get('ext', '')
@@ -1365,25 +1439,24 @@ def drive_browser():
     folders = []
     stats = {'count': 0, 'bytes': 0, 'archives': 0}
     extensions = []
+    service_stats = {}
 
     if db:
-        # Check if we have Drive data locally
-        drive_count = db.execute(
-            "SELECT COUNT(*) FROM files WHERE source_service = 'drive'"
-        ).fetchone()[0]
+        file_count = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
-        if drive_count > 0:
-            files, total = _query_drive_local(db, path or None, query or None, ext or None, page, per_page)
-            folders = _get_drive_folders(db, path or None)
-            stats = _get_drive_stats(db)
-            extensions = _get_drive_extensions(db)
+        if file_count > 0:
+            files, total = _query_files_local(db, service or None, path or None, query or None, ext or None, page, per_page)
+            folders = _get_file_folders(db, service or None, path or None)
+            stats = _get_file_stats(db, service or None)
+            extensions = _get_file_extensions(db, service or None)
+            service_stats = _get_service_stats(db)
         else:
             use_pi_nas = True
     else:
         use_pi_nas = True
 
     if use_pi_nas:
-        files, total = _query_drive_pi_nas(path or None, query or None, ext or None, page, per_page)
+        files, total = _query_files_pi_nas(service or None, path or None, query or None, ext or None, page, per_page)
 
     # Build breadcrumbs
     breadcrumbs = []
@@ -1395,38 +1468,45 @@ def drive_browser():
                 'path': '/'.join(parts[:i + 1])
             })
 
-    return render_template('drive_browser.html',
+    # Compute path prefix length for display (strip Takeout/Service/ from paths)
+    prefix_len = len(_get_path_prefix(service or None))
+
+    return render_template('files_browser.html',
                            files=files,
                            total=total,
                            folders=folders,
                            stats=stats,
                            extensions=extensions,
+                           service_stats=service_stats,
                            breadcrumbs=breadcrumbs,
                            current_path=path,
+                           current_service=service,
                            query=query,
                            ext_filter=ext,
                            page=page,
                            per_page=per_page,
                            use_pi_nas=use_pi_nas,
-                           drive_prefix_len=DRIVE_PREFIX_LEN)
+                           path_prefix_len=prefix_len)
 
 
-@app.route('/api/drive/folders')
-def api_drive_folders():
-    """API: Get subfolders for a Drive path."""
+@app.route('/api/files/folders')
+def api_files_folders():
+    """API: Get subfolders for a path, optionally filtered by service."""
     parent = request.args.get('path', '')
+    service = request.args.get('service', '')
     db = get_files_db()
     if not db:
         return jsonify({'folders': [], 'error': 'No local files DB'}), 200
 
-    folders = _get_drive_folders(db, parent or None)
-    return jsonify({'path': parent, 'folders': folders})
+    folders = _get_file_folders(db, service or None, parent or None)
+    return jsonify({'path': parent, 'service': service, 'folders': folders})
 
 
-@app.route('/api/drive/search')
-def api_drive_search():
-    """API: FTS5 search across Drive files."""
+@app.route('/api/files/search')
+def api_files_search():
+    """API: FTS5 search across files, optionally filtered by service."""
     query = request.args.get('q', '')
+    service = request.args.get('service', '')
     ext = request.args.get('ext', '')
     limit = request.args.get('limit', 50, type=int)
 
@@ -1438,26 +1518,483 @@ def api_drive_search():
         return jsonify({'error': 'No local files DB', 'results': []}), 200
 
     params = [query]
-    ext_clause = ''
+    extra_clauses = ''
+    if service:
+        extra_clauses += ' AND f.source_service = ?'
+        params.append(service)
     if ext:
-        ext_clause = ' AND f.extension = ?'
+        extra_clauses += ' AND f.extension = ?'
         params.append(ext)
 
     results = db.execute(f'''
-        SELECT f.path, f.filename, f.extension, f.size_bytes, f.source_archive
+        SELECT f.path, f.filename, f.extension, f.size_bytes,
+               f.source_service, f.source_archive
         FROM files f
-        WHERE f.source_service = 'drive'
-          AND f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)
-          {ext_clause}
+        WHERE f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)
+          {extra_clauses}
         ORDER BY f.path
         LIMIT ?
     ''', params + [limit]).fetchall()
 
     return jsonify({
         'query': query,
+        'service': service,
         'count': len(results),
         'results': [dict(r) for r in results]
     })
+
+
+# =============================================================================
+# Photo Browser Routes
+# =============================================================================
+
+# Media type classifications
+PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+RAW_EXTENSIONS = {'.dng', '.raf', '.cr2', '.arw', '.nef', '.orf', '.rw2'}
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.3gp', '.m4v', '.mov', '.webm'}
+METADATA_EXTENSIONS = {'.json'}
+
+
+def _parse_date_from_filename(filename):
+    """Extract (year, month) from filename like IMG_20251207_174455917.jpg.
+    Returns (year_str, month_int) or (None, None) if unparseable."""
+    import re
+    # Match IMG_YYYYMMDD or DSCF patterns, or Screenshot_YYYYMMDD
+    m = re.search(r'(\d{4})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', filename)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None, None
+
+
+def _parse_year_from_folder(path):
+    """Extract year from folder like 'Photos from 2025'."""
+    import re
+    m = re.search(r'Photos from (\d{4})', path)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _get_base_name(filename):
+    """Strip extension to get base name for pairing.
+    For JSON sidecars like 'IMG.jpg.supplemental-metadata.json', extract 'IMG.jpg'."""
+    import re
+    # Handle supplemental metadata JSON: strip .supplemental-metadata.json or truncated variants
+    sidecar_match = re.match(r'^(.+?)\.(supplemental-metad(?:ata)?\.json|suppleme\.json|supplem\.json)$', filename, re.IGNORECASE)
+    if sidecar_match:
+        return sidecar_match.group(1)
+    # Handle regular JSON sidecars that share the base name with media
+    # e.g. Screenshot_2021-06-21-01-12-48-437_com.coindcx.json -> base is same as .png
+    # For non-sidecar files, just strip extension
+    name, ext = os.path.splitext(filename)
+    return name
+
+
+def _query_photos_pi_nas(year=None, month=None, view='photos', page=1, per_page=100):
+    """Query photo files from Pi NAS, returns raw file list."""
+    import subprocess
+
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    if not check_node_reachable(pi_ssh, use_ssh=True):
+        return [], 0, False  # files, total, reachable
+
+    where_parts = ["source_service = 'photos'"]
+
+    # Filter by year via folder path
+    if year:
+        where_parts.append(f"path LIKE '%Photos from {year}%'")
+
+    # Filter by extension based on view
+    if view == 'photos':
+        exts = "','".join(PHOTO_EXTENSIONS | RAW_EXTENSIONS | METADATA_EXTENSIONS)
+        where_parts.append(f"extension IN ('{exts}')")
+    elif view == 'videos':
+        exts = "','".join(VIDEO_EXTENSIONS | METADATA_EXTENSIONS)
+        where_parts.append(f"extension IN ('{exts}')")
+    elif view == 'other':
+        all_known = PHOTO_EXTENSIONS | RAW_EXTENSIONS | VIDEO_EXTENSIONS | METADATA_EXTENSIONS
+        exts = "','".join(all_known)
+        where_parts.append(f"extension NOT IN ('{exts}')")
+        where_parts.append("filename != 'metadata.json'")
+
+    where_sql = ' AND '.join(where_parts)
+
+    # Get count first (without month filter - month is parsed from filename in Python)
+    count_sql = f"SELECT COUNT(*) FROM files WHERE {where_sql};"
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 {PI_FILES_DB} "{count_sql}"'],
+            capture_output=True, text=True, timeout=15
+        )
+        total = int(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else 0
+    except Exception:
+        return [], 0, True
+
+    # Get all files (we filter by month in Python since it's parsed from filename)
+    # For month filtering we need all files in that year, then filter in Python
+    files_sql = f"""SELECT path, filename, extension, size_bytes, source_archive, extracted, extracted_path
+        FROM files WHERE {where_sql} ORDER BY filename;"""
+
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 -separator "|" {PI_FILES_DB} "{files_sql}"'],
+            capture_output=True, text=True, timeout=60
+        )
+        files = []
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.strip().split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 7:
+                    files.append({
+                        'path': parts[0],
+                        'filename': parts[1],
+                        'extension': parts[2],
+                        'size_bytes': int(parts[3]) if parts[3] else 0,
+                        'source_archive': parts[4],
+                        'extracted': parts[5] == '1',
+                        'extracted_path': parts[6] if parts[6] else None,
+                    })
+        return files, total, True
+    except Exception:
+        return [], 0, True
+
+
+def _query_photos_local(db, year=None, month=None, view='photos'):
+    """Query photo files from local DB, returns raw file list."""
+    where_parts = ["source_service = 'photos'"]
+
+    if year:
+        where_parts.append(f"path LIKE '%Photos from {year}%'")
+
+    if view == 'photos':
+        exts = "','".join(PHOTO_EXTENSIONS | RAW_EXTENSIONS | METADATA_EXTENSIONS)
+        where_parts.append(f"extension IN ('{exts}')")
+    elif view == 'videos':
+        exts = "','".join(VIDEO_EXTENSIONS | METADATA_EXTENSIONS)
+        where_parts.append(f"extension IN ('{exts}')")
+    elif view == 'other':
+        all_known = PHOTO_EXTENSIONS | RAW_EXTENSIONS | VIDEO_EXTENSIONS | METADATA_EXTENSIONS
+        exts = "','".join(all_known)
+        where_parts.append(f"extension NOT IN ('{exts}')")
+        where_parts.append("filename != 'metadata.json'")
+
+    where_sql = ' AND '.join(where_parts)
+
+    files = db.execute(f'''
+        SELECT path, filename, extension, size_bytes, source_archive, extracted, extracted_path
+        FROM files WHERE {where_sql} ORDER BY filename
+    ''').fetchall()
+
+    return [dict(f) for f in files]
+
+
+def _pair_photo_files(files, month=None):
+    """Group files into paired rows: {jpg, raw, json, video} by base name.
+    Optionally filter by month (parsed from filename).
+    Returns (paired_list, month_counts)."""
+    import re
+    from collections import defaultdict
+
+    # Group by directory + base media name
+    groups = defaultdict(lambda: {'jpg': None, 'raw': None, 'json': [], 'video': None})
+    month_counter = defaultdict(int)  # month_num -> count of media files
+
+    for f in files:
+        fname = f['filename']
+        ext = f['extension'].lower()
+        fdir = os.path.dirname(f['path'])
+
+        # Determine the base media name for grouping
+        if ext == '.json':
+            # JSON sidecar - find the media file it belongs to
+            # Pattern: {media_filename}.supplemental-metadata.json (possibly truncated)
+            sidecar_match = re.match(
+                r'^(.+?\.\w+)\.suppleme',
+                fname, re.IGNORECASE
+            )
+            if sidecar_match:
+                media_name = sidecar_match.group(1)
+                base = os.path.splitext(media_name)[0]
+                key = (fdir, base)
+                groups[key]['json'].append(f)
+                continue
+            # Non-sidecar JSON (e.g., metadata.json, shared_album_comments.json) - skip
+            if fname in ('metadata.json', 'shared_album_comments.json', 'user-generated-memory-titles.json'):
+                continue
+            # Other JSON files that share base name with media
+            base = os.path.splitext(fname)[0]
+            key = (fdir, base)
+            groups[key]['json'].append(f)
+            continue
+
+        base = os.path.splitext(fname)[0]
+        key = (fdir, base)
+
+        # Parse date for month counting
+        year_str, month_num = _parse_date_from_filename(fname)
+        if month_num:
+            month_counter[month_num] += 1
+
+        if ext in PHOTO_EXTENSIONS:
+            groups[key]['jpg'] = f
+        elif ext in RAW_EXTENSIONS:
+            groups[key]['raw'] = f
+        elif ext in VIDEO_EXTENSIONS:
+            groups[key]['video'] = f
+
+    # Filter by month if specified
+    def _sort_key(item):
+        (fdir, base), group = item
+        primary = group['jpg'] or group['raw'] or group['video']
+        if primary:
+            return primary['filename']
+        return base
+
+    paired = []
+    for (fdir, base), group in sorted(groups.items(), key=_sort_key):
+        # Get the primary file for date extraction
+        primary = group['jpg'] or group['raw'] or group['video']
+        if not primary:
+            # Only JSON, no media file - skip
+            continue
+
+        if month:
+            _, file_month = _parse_date_from_filename(primary['filename'])
+            if file_month != month:
+                continue
+
+        paired.append({
+            'base_name': base,
+            'jpg': group['jpg'],
+            'raw': group['raw'],
+            'json': group['json'],
+            'video': group['video'],
+        })
+
+    return paired, dict(month_counter)
+
+
+def _get_photo_years_pi_nas():
+    """Get list of years with photo counts from Pi NAS."""
+    import subprocess
+
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    sql = """SELECT DISTINCT
+        CASE
+            WHEN path LIKE '%Photos from%'
+            THEN SUBSTR(path, INSTR(path, 'Photos from ') + 12, 4)
+            ELSE 'unknown'
+        END as year,
+        COUNT(*) as cnt
+        FROM files
+        WHERE source_service = 'photos' AND extension NOT IN ('.json')
+        GROUP BY year ORDER BY year;"""
+
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 -separator "|" {PI_FILES_DB} "{sql}"'],
+            capture_output=True, text=True, timeout=15
+        )
+        years = []
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.strip().split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 2 and parts[0] != 'unknown':
+                    years.append({'year': parts[0], 'count': int(parts[1])})
+        return years
+    except Exception:
+        return []
+
+
+def _get_photo_years_local(db):
+    """Get list of years with photo counts from local DB."""
+    rows = db.execute("""
+        SELECT DISTINCT
+            CASE
+                WHEN path LIKE '%Photos from%'
+                THEN SUBSTR(path, INSTR(path, 'Photos from ') + 12, 4)
+                ELSE 'unknown'
+            END as year,
+            COUNT(*) as cnt
+        FROM files
+        WHERE source_service = 'photos' AND extension NOT IN ('.json')
+        GROUP BY year ORDER BY year
+    """).fetchall()
+    return [{'year': r['year'], 'count': r['cnt']} for r in rows if r['year'] != 'unknown']
+
+
+@app.route('/files/photos')
+def photos_browser():
+    """Dedicated photo browser with month filtering and JPG+RAW+JSON pairing."""
+    year = request.args.get('year', '')
+    month = request.args.get('month', 0, type=int)
+    view = request.args.get('view', 'photos')  # photos, videos, other
+    page = request.args.get('page', 1, type=int)
+    per_page = 100
+
+    # Try Pi NAS first (has all 5 photo archives), fall back to local
+    pi_reachable = False
+    files = []
+    years = []
+    data_source = 'none'
+
+    # Get years list
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    pi_reachable = check_node_reachable(pi_ssh, use_ssh=True)
+
+    if pi_reachable:
+        years = _get_photo_years_pi_nas()
+        data_source = 'pi-nas'
+    else:
+        db = get_files_db()
+        if db:
+            years = _get_photo_years_local(db)
+            data_source = 'local'
+
+    # Default to latest year
+    if not year and years:
+        year = years[-1]['year']
+
+    # Get files for selected year
+    if pi_reachable:
+        files, total_raw, _ = _query_photos_pi_nas(year=year, month=None, view=view)
+    else:
+        db = get_files_db()
+        if db:
+            files = _query_photos_local(db, year=year, month=None, view=view)
+
+    # Pair files and get month counts
+    if view == 'photos':
+        paired, month_counts = _pair_photo_files(files, month=month if month else None)
+        # Paginate paired results
+        total_paired = len(paired)
+        start = (page - 1) * per_page
+        paired_page = paired[start:start + per_page]
+    elif view == 'videos':
+        paired, month_counts = _pair_photo_files(files, month=month if month else None)
+        # For videos tab, only show rows that have a video
+        video_rows = [p for p in paired if p['video']]
+        total_paired = len(video_rows)
+        start = (page - 1) * per_page
+        paired_page = video_rows[start:start + per_page]
+    else:
+        # 'other' view - no pairing, just list
+        paired_page = [{'jpg': f, 'raw': None, 'json': [], 'video': None, 'base_name': f['filename']} for f in files]
+        month_counts = {}
+        total_paired = len(paired_page)
+        start = (page - 1) * per_page
+        paired_page = paired_page[start:start + per_page]
+
+    # Count files per view for tab badges
+    view_counts = {'photos': 0, 'videos': 0, 'other': 0}
+    if pi_reachable:
+        import subprocess
+        for v, exts in [('photos', PHOTO_EXTENSIONS | RAW_EXTENSIONS), ('videos', VIDEO_EXTENSIONS)]:
+            ext_list = "','".join(exts)
+            sql = f"SELECT COUNT(*) FROM files WHERE source_service='photos' AND path LIKE '%Photos from {year}%' AND extension IN ('{ext_list}');"
+            try:
+                proc = subprocess.run(
+                    ['ssh', '-o', 'ConnectTimeout=3', pi_ssh,
+                     f'sqlite3 {PI_FILES_DB} "{sql}"'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    view_counts[v] = int(proc.stdout.strip())
+            except Exception:
+                pass
+    else:
+        db = get_files_db()
+        if db:
+            for v, exts in [('photos', PHOTO_EXTENSIONS | RAW_EXTENSIONS), ('videos', VIDEO_EXTENSIONS)]:
+                ext_list = "','".join(exts)
+                row = db.execute(f"""
+                    SELECT COUNT(*) FROM files
+                    WHERE source_service='photos' AND path LIKE ? AND extension IN ('{ext_list}')
+                """, (f'%Photos from {year}%',)).fetchone()
+                view_counts[v] = row[0] if row else 0
+
+    return render_template('photos_browser.html',
+                           paired=paired_page,
+                           years=years,
+                           current_year=year,
+                           current_month=month,
+                           current_view=view,
+                           month_counts=month_counts,
+                           view_counts=view_counts,
+                           total=total_paired,
+                           page=page,
+                           per_page=per_page,
+                           data_source=data_source,
+                           pi_reachable=pi_reachable)
+
+
+@app.route('/api/files/extract', methods=['POST'])
+def extract_file():
+    """Extract a single file from a zip archive on Pi NAS."""
+    import subprocess
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body required'}), 400
+
+    file_path = data.get('path', '')
+    archive = data.get('archive', '')
+
+    if not file_path or not archive:
+        return jsonify({'error': 'path and archive are required'}), 400
+
+    # Sanitize inputs - prevent path traversal
+    if '..' in file_path or '..' in archive:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    if not check_node_reachable(pi_ssh, use_ssh=True):
+        return jsonify({'error': 'Pi NAS not reachable'}), 503
+
+    archive_path = f'/mnt/nas/t7/takeout-archives/{archive}'
+    extract_dir = '/mnt/nas/prabhanshu-files/extracted'
+
+    # Use Python zipfile on Pi NAS to extract single file
+    extract_cmd = f"""python3 -c "
+import zipfile, os
+z = zipfile.ZipFile('{archive_path}')
+z.extract('{file_path}', '{extract_dir}')
+print('OK')
+" """
+
+    try:
+        proc = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh, extract_cmd],
+            capture_output=True, text=True, timeout=120
+        )
+
+        if proc.returncode != 0:
+            return jsonify({'error': f'Extraction failed: {proc.stderr}'}), 500
+
+        extracted_path = f'{extract_dir}/{file_path}'
+
+        # Update DB to mark as extracted
+        update_sql = f"UPDATE files SET extracted=1, extracted_path='{extracted_path}' WHERE path='{file_path}' AND source_archive='{archive}';"
+        subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', pi_ssh,
+             f'sqlite3 {PI_FILES_DB} "{update_sql}"'],
+            capture_output=True, text=True, timeout=15
+        )
+
+        return jsonify({
+            'success': True,
+            'extracted_path': extracted_path,
+            'path': file_path,
+            'archive': archive
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Extraction timed out'}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def main():
