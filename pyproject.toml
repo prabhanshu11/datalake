@@ -5,6 +5,9 @@ description = "Personal data lake for Claude Code conversations, voice typing, a
 requires-python = ">=3.13"
 dependencies = [
     "flask>=3.0.0",
+    "elasticsearch>=8.11.0",
+    "claude-agent-sdk>=0.1.19",
+    "anthropic>=0.40.0",
 ]
 
 [project.scripts]

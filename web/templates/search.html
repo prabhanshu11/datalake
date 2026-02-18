@@ -101,9 +101,33 @@
         font-size: 0.85rem;
         margin-left: 0.5rem;
     }
+    .backend-badge {
+        display: inline-block;
+        padding: 0.3rem 0.7rem;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-left: 1rem;
+    }
+    .backend-elasticsearch {
+        background: #1f6feb20;
+        color: #58a6ff;
+        border: 1px solid #1f6feb;
+    }
+    .backend-sqlite {
+        background: #f0883e20;
+        color: #f0883e;
+        border: 1px solid #f0883e;
+    }
 </style>
 
-<h1>Search</h1>
+<h1>Search
+    {% if backend %}
+        <span class="backend-badge backend-{{ backend }}">
+            {% if backend == 'elasticsearch' %}⚡ Elasticsearch{% else %}💾 SQLite FTS{% endif %}
+        </span>
+    {% endif %}
+</h1>
 
 <form class="search-form" method="GET" action="/search">
     <input type="text" name="q" value="{{ query }}" placeholder="Search conversations, history, transcripts..." autofocus>
@@ -119,13 +143,13 @@
 {% if not query %}
 <div class="search-tips">
     <h3>Search Tips</h3>
-    <p>This search uses SQLite FTS5 (Full-Text Search). Examples:</p>
+    <p>This search uses <strong>Elasticsearch</strong> with automatic fallback to SQLite FTS5. Examples:</p>
     <ul style="margin-top: 0.5rem; margin-left: 1.5rem; color: #8b949e;">
         <li><code>python flask</code> - Find documents containing both words</li>
         <li><code>"exact phrase"</code> - Find an exact phrase</li>
-        <li><code>flask OR django</code> - Find documents with either word</li>
+        <li><code>flask OR django</code> - Find documents with either word (Elasticsearch only)</li>
         <li><code>python -testing</code> - Find python but not testing</li>
-        <li><code>func*</code> - Wildcard: function, functional, etc.</li>
+        <li>Fuzzy matching automatically handles typos when Elasticsearch is active</li>
     </ul>
 </div>
 {% endif %}
@@ -142,6 +166,24 @@
                     <a href="/session/{{ r.session_id }}">{{ r.summary or r.session_id[:8] + '...' }}</a>
                 </div>
                 <span class="result-meta">{{ r.timestamp[:16] if r.timestamp else '' }}</span>
+            </div>
+            <div class="result-content">{{ r.content_text[:500] }}{% if r.content_text|length > 500 %}...{% endif %}</div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if results.chatgpt %}
+    <div class="results-section">
+        <h2>ChatGPT Messages <span class="count-badge">{{ results.chatgpt|length }}</span></h2>
+        {% for r in results.chatgpt %}
+        <div class="result-card">
+            <div class="result-header">
+                <div>
+                    <span class="badge badge-{{ r.role or 'user' }}">{{ r.role or 'user' }}</span>
+                    <a href="/chatgpt/{{ r.conversation_id }}">{{ r.title or r.conversation_id[:8] + '...' }}</a>
+                </div>
+                <span class="result-meta">{{ r.create_time[:16] if r.create_time else '' }}</span>
             </div>
             <div class="result-content">{{ r.content_text[:500] }}{% if r.content_text|length > 500 %}...{% endif %}</div>
         </div>
@@ -190,7 +232,7 @@
     </div>
     {% endif %}
 
-    {% if not results.messages and not results.history and not results.transcripts %}
+    {% if not results.messages and not results.chatgpt and not results.history and not results.transcripts %}
     <div class="no-results">
         <h2>No results found</h2>
         <p>Try adjusting your search terms or using different keywords.</p>

@@ -1,10 +1,25 @@
 services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: datalake-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+
   datalake:
     build:
       context: .
       dockerfile: Dockerfile
     image: datalake:latest
     container_name: datalake
+    depends_on:
+      - elasticsearch
 
     # Environment variables (isolated per container)
     environment:
@@ -13,6 +28,7 @@ services:
       - LOG_DIR=/app/logs
       - PROJECT_ROOT=/app
       - SCHEMA_FILE=/app/schema.sql
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
 
     # Volume mounts
     volumes:
@@ -48,6 +64,8 @@ services:
           memory: 256M
 
 volumes:
+  elasticsearch-data:
+    driver: local
   datalake-data:
     driver: local
   datalake-logs:

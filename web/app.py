@@ -15,6 +15,7 @@ from datetime import datetime
 from flask import Flask, render_template, request, jsonify, g
 from pathlib import Path
 from flask import send_from_directory
+from search.es_client import DatalakeSearch
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB for ChatGPT zips
@@ -211,15 +212,52 @@ def voice_sessions():
 
 @app.route('/search')
 def search():
-    """Search across all content."""
+    """Search across all content using Elasticsearch with SQLite FTS fallback."""
     query = request.args.get('q', '')
     search_type = request.args.get('type', 'all')
 
     if not query:
-        return render_template('search.html', results=None, query='')
+        return render_template('search.html', results=None, query='', backend=None)
 
+    # Initialize Elasticsearch
+    es = DatalakeSearch()
+    search_backend = None
+
+    # Try Elasticsearch first
+    if es.available:
+        try:
+            # Map search type to ES sources
+            sources = []
+            if search_type in ('all', 'messages'):
+                sources.extend(['claude', 'chatgpt'])
+            if search_type in ('all', 'transcripts'):
+                sources.append('voice')
+
+            es_results = es.search(query=query, sources=sources, limit=50)
+
+            if es_results is not None:
+                # Convert ES results to format expected by template
+                results = {
+                    'messages': es_results.get('claude', []),
+                    'chatgpt': es_results.get('chatgpt', []),
+                    'transcripts': es_results.get('voice', []),
+                    'history': []  # Not using history search anymore
+                }
+                search_backend = 'elasticsearch'
+
+                return render_template('search.html',
+                                     results=results,
+                                     query=query,
+                                     backend=search_backend,
+                                     search_type=search_type)
+        except Exception as e:
+            # Log error but continue to fallback
+            print(f"Elasticsearch search error: {e}")
+
+    # Fallback to SQLite FTS
     db = get_db()
-    results = {'messages': [], 'history': [], 'transcripts': []}
+    results = {'messages': [], 'history': [], 'chatgpt': [], 'transcripts': []}
+    search_backend = 'sqlite'
 
     if search_type in ('all', 'messages'):
         # Search Claude messages
@@ -234,6 +272,20 @@ def search():
                 LIMIT 50
             )
             ORDER BY cm.timestamp DESC
+        ''', (query,)).fetchall()
+
+        # Search ChatGPT messages
+        results['chatgpt'] = db.execute('''
+            SELECT cm.id, cm.content_text, cm.role, cm.create_time,
+                   cc.conversation_id, cc.title
+            FROM chatgpt_messages cm
+            JOIN chatgpt_conversations cc ON cm.conversation_id = cc.id
+            WHERE cm.id IN (
+                SELECT rowid FROM chatgpt_messages_fts
+                WHERE chatgpt_messages_fts MATCH ?
+                LIMIT 50
+            )
+            ORDER BY cm.create_time DESC
         ''', (query,)).fetchall()
 
     if search_type in ('all', 'history'):
@@ -262,7 +314,11 @@ def search():
             ORDER BY t.created_at DESC
         ''', (query,)).fetchall()
 
-    return render_template('search.html', results=results, query=query)
+    return render_template('search.html',
+                         results=results,
+                         query=query,
+                         backend=search_backend,
+                         search_type=search_type)
 
 
 @app.route('/api/rate/<item_type>/<int:item_id>', methods=['POST'])
@@ -312,6 +368,20 @@ def voice_feedback(voice_id):
     db.commit()
 
     return jsonify({'success': True})
+
+
+@app.route('/api/health')
+def api_health():
+    """API health check endpoint."""
+    es = DatalakeSearch()
+
+    health = {
+        'database': 'ok',
+        'elasticsearch': 'ok' if es.available else 'unavailable',
+        'search_backend': 'elasticsearch' if es.available else 'sqlite'
+    }
+
+    return jsonify(health)
 
 
 @app.route('/api/stats')

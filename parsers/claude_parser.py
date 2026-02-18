@@ -436,15 +436,28 @@ class DatalakeIngester:
         cursor = self.conn.cursor()
 
         try:
-            # Insert session
+            # Upsert session — insert new or update metadata for existing
             cursor.execute('''
-                INSERT OR IGNORE INTO claude_sessions
+                INSERT INTO claude_sessions
                 (session_id, project_path, project_encoded, summary, model_primary,
                  claude_version, git_branch, total_messages, user_messages,
                  assistant_messages, total_input_tokens, total_output_tokens,
                  total_cache_read_tokens, total_cache_creation_tokens,
                  source_device, source_file, started_at, ended_at, duration_seconds)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    summary = COALESCE(excluded.summary, summary),
+                    model_primary = COALESCE(excluded.model_primary, model_primary),
+                    claude_version = COALESCE(excluded.claude_version, claude_version),
+                    total_messages = excluded.total_messages,
+                    user_messages = excluded.user_messages,
+                    assistant_messages = excluded.assistant_messages,
+                    total_input_tokens = excluded.total_input_tokens,
+                    total_output_tokens = excluded.total_output_tokens,
+                    total_cache_read_tokens = excluded.total_cache_read_tokens,
+                    total_cache_creation_tokens = excluded.total_cache_creation_tokens,
+                    ended_at = excluded.ended_at,
+                    duration_seconds = excluded.duration_seconds
             ''', (
                 session.session_id,
                 session.project_path,
@@ -467,16 +480,13 @@ class DatalakeIngester:
                 session.duration_seconds
             ))
 
-            if cursor.rowcount == 0:
-                # Session already exists, get its ID
-                cursor.execute(
-                    'SELECT id FROM claude_sessions WHERE session_id = ?',
-                    (session.session_id,)
-                )
-                row = cursor.fetchone()
-                session_db_id = row['id'] if row else None
-            else:
-                session_db_id = cursor.lastrowid
+            # Get session DB ID (works for both insert and update)
+            cursor.execute(
+                'SELECT id FROM claude_sessions WHERE session_id = ?',
+                (session.session_id,)
+            )
+            row = cursor.fetchone()
+            session_db_id = row['id'] if row else None
 
             if session_db_id is None:
                 return None
