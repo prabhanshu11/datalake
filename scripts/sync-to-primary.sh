@@ -45,9 +45,14 @@ if ! ssh -o ConnectTimeout=5 "$REMOTE_HOST" "test -f $REMOTE_DB"; then
     exit 1
 fi
 
+# Helper: run sqlite3 with busy timeout (other processes may hold locks)
+sq() {
+    sqlite3 -cmd ".timeout 60000" "$@"
+}
+
 # Count local records to sync
 log "Counting local records..."
-LOCAL_STATS=$(sqlite3 "$LOCAL_DB" "
+LOCAL_STATS=$(sq "$LOCAL_DB" "
 SELECT
     (SELECT COUNT(*) FROM claude_history WHERE source_device = '$LOCAL_DEVICE') as history,
     (SELECT COUNT(*) FROM claude_sessions WHERE source_device = '$LOCAL_DEVICE') as sessions,
@@ -57,12 +62,31 @@ SELECT
 ")
 log "Local records: $LOCAL_STATS"
 
-# Copy database to remote for ATTACH-based merge
-log "Transferring database to remote..."
-scp -q "$LOCAL_DB" "$REMOTE_HOST:/tmp/datalake_sync_source.db"
+# Create a consistent snapshot using VACUUM INTO
+# This creates an atomic, consistent copy even with concurrent writers.
+# Raw scp of a DB with active writers produces a corrupt copy
+# because the -journal file is not included.
+SNAPSHOT="/tmp/datalake_sync_snapshot.db"
+log "Creating consistent snapshot via VACUUM INTO..."
+rm -f "$SNAPSHOT"
+sq "$LOCAL_DB" "VACUUM INTO '$SNAPSHOT';"
+
+# Verify snapshot integrity before transferring
+if ! sqlite3 "$SNAPSHOT" "PRAGMA integrity_check;" | grep -q "^ok$"; then
+    error "Snapshot failed integrity check, aborting"
+    rm -f "$SNAPSHOT"
+    exit 1
+fi
+log "Snapshot OK ($(du -h "$SNAPSHOT" | cut -f1))"
+
+# Transfer snapshot to remote
+log "Transferring snapshot to remote..."
+scp -q "$SNAPSHOT" "$REMOTE_HOST:/tmp/datalake_sync_source.db"
+rm -f "$SNAPSHOT"
 
 log "Merging on remote using ATTACH..."
-ssh "$REMOTE_HOST" 'sqlite3 ~/Programs/datalake/datalake.db "
+ssh "$REMOTE_HOST" 'set -e
+sqlite3 ~/Programs/datalake/datalake.db "
 -- Attach source database
 ATTACH DATABASE '\''/tmp/datalake_sync_source.db'\'' AS source;
 
@@ -121,7 +145,7 @@ rm -f /tmp/datalake_sync_source.db
 
 # Log sync event
 START_TIME=$(date -Iseconds)
-sqlite3 "$LOCAL_DB" "
+sq "$LOCAL_DB" "
 INSERT INTO sync_log (source_device, target_device, sync_type, started_at, completed_at, status)
 VALUES ('$LOCAL_DEVICE', 'laptop', 'incremental', '$START_TIME', datetime('now'), 'success');
 " 2>/dev/null || true
