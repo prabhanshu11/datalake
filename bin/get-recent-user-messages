@@ -12,6 +12,8 @@ Usage:
     get-recent-user-messages --json             # JSON output
     get-recent-user-messages --follow-chain     # Include parent session (subagents)
     get-recent-user-messages -s UUID            # Explicit session UUID
+    get-recent-user-messages --stats            # Show session history stats
+    get-recent-user-messages --include-previous 2  # Current + previous session
 """
 
 import argparse
@@ -19,6 +21,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -52,6 +55,18 @@ def find_project_dir() -> Path | None:
     return None
 
 
+def list_session_files(project_dir: Path) -> list[Path]:
+    """Return all UUID JSONL files in project dir, sorted newest first by mtime."""
+    if not project_dir or not project_dir.exists():
+        return []
+    candidates = [
+        f for f in project_dir.iterdir()
+        if f.is_file() and f.suffix == ".jsonl" and UUID_PATTERN.match(f.stem)
+    ]
+    candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return candidates
+
+
 def find_session_file(session_id: str | None, project_dir: Path | None) -> Path | None:
     """Locate the JSONL file for the given session, or the most recent one."""
     if session_id and project_dir:
@@ -59,16 +74,8 @@ def find_session_file(session_id: str | None, project_dir: Path | None) -> Path 
         if candidate.exists():
             return candidate
 
-    if project_dir and project_dir.exists():
-        # Most recently modified UUID JSONL = active session
-        candidates = [
-            f for f in project_dir.iterdir()
-            if f.is_file() and f.suffix == ".jsonl" and UUID_PATTERN.match(f.stem)
-        ]
-        if candidates:
-            return max(candidates, key=lambda f: f.stat().st_mtime)
-
-    return None
+    files = list_session_files(project_dir)
+    return files[0] if files else None
 
 
 def find_parent_file(session_file: Path) -> Path | None:
@@ -171,6 +178,50 @@ def fallback_db(session_id: str | None, n: int, follow_chain: bool) -> list[dict
         dq.close()
 
 
+def human_size(size_bytes: int) -> str:
+    """Format bytes as human-readable size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(size_bytes) < 1024:
+            if unit == "B":
+                return f"{size_bytes} {unit}"
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+def print_stats(project_dir: Path | None) -> None:
+    """Print session history statistics for the project directory."""
+    if not project_dir:
+        print("Error: Could not find project directory.", file=sys.stderr)
+        sys.exit(1)
+
+    files = list_session_files(project_dir)
+    if not files:
+        print("No sessions found.")
+        return
+
+    # Compute stats
+    mtimes = [(f, f.stat()) for f in files]
+    oldest_f, oldest_st = mtimes[-1]
+    newest_f, newest_st = mtimes[0]
+
+    oldest_dt = datetime.fromtimestamp(oldest_st.st_mtime, tz=timezone.utc)
+    newest_dt = datetime.fromtimestamp(newest_st.st_mtime, tz=timezone.utc)
+    span_days = (newest_dt - oldest_dt).days
+
+    print(f"\nProject: {project_dir.name}")
+    print(f"Sessions: {len(files)} (spanning {span_days} day{'s' if span_days != 1 else ''})")
+    print(f"Oldest:   {oldest_dt.strftime('%Y-%m-%d %H:%M')} ({oldest_f.stem[:8]}...) — {human_size(oldest_st.st_size)}")
+    print(f"Newest:   {newest_dt.strftime('%Y-%m-%d %H:%M')} ({newest_f.stem[:8]}...) — {human_size(newest_st.st_size)}")
+
+    show_n = min(5, len(files))
+    print(f"\nLast {show_n} sessions:")
+    for i, (f, st) in enumerate(mtimes[:show_n], 1):
+        dt = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        print(f"  {i}. {f.stem[:8]}... | {dt.strftime('%Y-%m-%d %H:%M')} | {human_size(st.st_size)}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Read user messages from current Claude session (JSONL-first)",
@@ -182,6 +233,8 @@ Examples:
     get-recent-user-messages --follow-chain     # Include parent session (subagents)
     get-recent-user-messages --json             # JSON with metadata
     get-recent-user-messages -s UUID            # Specific session by UUID
+    get-recent-user-messages --stats            # Show session history stats
+    get-recent-user-messages --include-previous 2  # Current + previous session
 
 Reads from raw JSONL — works for live sessions without DB ingestion.
 """,
@@ -195,29 +248,61 @@ Reads from raw JSONL — works for live sessions without DB ingestion.
                         help="Bare text output, minimal tokens (default for agents)")
     parser.add_argument("--json", action="store_true",
                         help="JSON output with full metadata")
+    parser.add_argument("--stats", action="store_true",
+                        help="Show session history stats (no messages)")
+    parser.add_argument("--include-previous", type=int, default=1, metavar="N",
+                        help="Read from N most recent sessions (default: 1 = current only)")
     args = parser.parse_args()
 
-    session_id = args.session or os.environ.get("CLAUDE_SESSION_ID")
     project_dir = find_project_dir()
-    session_file = find_session_file(session_id, project_dir)
 
-    if session_file:
-        messages = read_user_messages_from_file(session_file)
+    # --stats mode: just print stats and exit
+    if args.stats:
+        print_stats(project_dir)
+        return
 
-        if args.follow_chain:
-            parent_file = find_parent_file(session_file)
-            if parent_file:
-                parent_msgs = read_user_messages_from_file(parent_file)
-                # Parent messages are older — prepend them
-                messages = parent_msgs + messages
+    session_id = args.session or os.environ.get("CLAUDE_SESSION_ID")
+    n_sessions = max(1, args.include_previous)
 
-        # Take last N
-        messages = messages[-args.last:] if len(messages) > args.last else messages
+    if n_sessions > 1 and not session_id:
+        # Multi-session mode: read from N most recent JSONL files
+        files = list_session_files(project_dir)
+        if not files:
+            print("Note: No JSONL files found, falling back to DB", file=sys.stderr)
+            messages = fallback_db(session_id, args.last, args.follow_chain)
+        else:
+            selected = files[:n_sessions]
+            # Reverse to oldest-first for chronological reading
+            selected.reverse()
 
+            messages = []
+            for f in selected:
+                file_msgs = read_user_messages_from_file(f)
+                messages.extend(file_msgs)
+
+            # Take last N from the combined set
+            messages = messages[-args.last:] if len(messages) > args.last else messages
     else:
-        # DB fallback
-        print("Note: JSONL file not found, falling back to DB", file=sys.stderr)
-        messages = fallback_db(session_id, args.last, args.follow_chain)
+        # Original single-session behavior
+        session_file = find_session_file(session_id, project_dir)
+
+        if session_file:
+            messages = read_user_messages_from_file(session_file)
+
+            if args.follow_chain:
+                parent_file = find_parent_file(session_file)
+                if parent_file:
+                    parent_msgs = read_user_messages_from_file(parent_file)
+                    # Parent messages are older — prepend them
+                    messages = parent_msgs + messages
+
+            # Take last N
+            messages = messages[-args.last:] if len(messages) > args.last else messages
+
+        else:
+            # DB fallback
+            print("Note: JSONL file not found, falling back to DB", file=sys.stderr)
+            messages = fallback_db(session_id, args.last, args.follow_chain)
 
     if not messages:
         if args.json:
@@ -232,7 +317,8 @@ Reads from raw JSONL — works for live sessions without DB ingestion.
         prev_source = None
         for msg in messages:
             if msg["source_file"] != prev_source and prev_source is not None:
-                print("\n--- parent session ---")
+                sid = msg["session_id"][:8] if msg["session_id"] else "?"
+                print(f"\n--- session {sid}... ---")
             print(msg["text"])
             print()
             prev_source = msg["source_file"]
@@ -244,7 +330,10 @@ Reads from raw JSONL — works for live sessions without DB ingestion.
         if msg["source_file"] != prev_source:
             ts = msg["timestamp"][:16].replace("T", " ") if msg["timestamp"] else ""
             sid = msg["session_id"][:8] if msg["session_id"] else "?"
-            label = "parent session" if prev_source is not None else f"session {sid}..."
+            if prev_source is None:
+                label = f"session {sid}..."
+            else:
+                label = f"session {sid}..."
             print(f"\n[{label}] {ts}")
             prev_source = msg["source_file"]
         print()

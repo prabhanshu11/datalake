@@ -3,7 +3,7 @@
 Get recent messages from the current or specified Claude session.
 
 Usage:
-    get-messages-from-current              # Last 5 messages from most recent session
+    get-messages-from-current              # Last 5 messages from current session (CWD-based)
     get-messages-from-current --last 10    # Last 10 messages
     get-messages-from-current --session abc123-uuid
     get-messages-from-current --json
@@ -11,6 +11,8 @@ Usage:
 
 import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -19,20 +21,66 @@ SCRIPT_PATH = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT_PATH.parent.parent / "lib"))
 from queries import DatalakeQueries
 
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+UUID_PATTERN = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+)
+
+
+def detect_session_from_jsonl() -> str | None:
+    """Detect the current session by finding the most recently modified JSONL in the CWD's project dir."""
+    cwd = os.getcwd()
+
+    # Try CWD and parent dirs to find a matching Claude project dir
+    p = Path(cwd)
+    project_dir = None
+    while True:
+        candidate = PROJECTS_DIR / str(p).replace("/", "-")
+        if candidate.exists():
+            project_dir = candidate
+            break
+        if p == p.parent:
+            break
+        p = p.parent
+
+    if not project_dir:
+        return None
+
+    # Find the most recently modified UUID JSONL
+    candidates = [
+        f for f in project_dir.iterdir()
+        if f.is_file() and f.suffix == ".jsonl" and UUID_PATTERN.match(f.stem)
+    ]
+    if not candidates:
+        return None
+
+    newest = max(candidates, key=lambda f: f.stat().st_mtime)
+    return newest.stem
+
 
 def get_current_session_id() -> str | None:
-    """Try to detect the current session from environment or recent sessions."""
-    # Check for CLAUDE_SESSION_ID environment variable
-    import os
+    """Detect the current session: env var → CWD-based JSONL → DB fallback."""
+    # 1. Check for CLAUDE_SESSION_ID environment variable
     session_id = os.environ.get("CLAUDE_SESSION_ID")
     if session_id:
         return session_id
 
-    # Fall back to most recent session
+    # 2. CWD-based JSONL detection (finds YOUR session, not a random DB session)
+    session_id = detect_session_from_jsonl()
+    if session_id:
+        return session_id
+
+    # 3. Fall back to most recent session in DB (may be wrong if multiple sessions active)
     dq = DatalakeQueries()
     try:
         sessions = dq.get_recent_sessions(limit=1)
         if sessions:
+            print(
+                "Note: Using DB fallback (could not detect session from CWD). "
+                "This may return a different session.",
+                file=sys.stderr,
+            )
             return sessions[0].session_id
     finally:
         dq.close()
@@ -46,14 +94,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    get-messages-from-current                    # Last 5 from most recent session
-    get-messages-from-current --last 1          # Just the last message
-    get-messages-from-current --session abc123  # Specific session
-    get-messages-from-current --user-only       # Only user messages
+    get-messages-from-current                    # Last 5 from current session (CWD-based)
+    get-messages-from-current --last 10          # Last 10 messages
+    get-messages-from-current --session abc123   # Specific session
+    get-messages-from-current --db-latest        # Most recent session in DB (any project)
+    get-messages-from-current --user-only        # Only user messages
     get-messages-from-current --json | jq '.[0].content_text'
-"""
+""",
     )
-    parser.add_argument("--session", "-s", help="Session ID (default: most recent)")
+    parser.add_argument("--session", "-s", help="Session ID (default: auto-detect via CWD)")
+    parser.add_argument("--db-latest", action="store_true",
+                        help="Use the most recent session from the DB (ignores CWD detection)")
     parser.add_argument("--last", "-n", type=int, default=5, help="Number of messages (default: 5)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--user-only", action="store_true", help="Only show user messages")
@@ -61,7 +112,15 @@ Examples:
     parser.add_argument("--show-thinking", action="store_true", help="Include thinking content")
     args = parser.parse_args()
 
-    session_id = args.session or get_current_session_id()
+    if args.db_latest:
+        dq = DatalakeQueries()
+        try:
+            sessions = dq.get_recent_sessions(limit=1)
+            session_id = sessions[0].session_id if sessions else None
+        finally:
+            dq.close()
+    else:
+        session_id = args.session or get_current_session_id()
     if not session_id:
         print("Error: Could not determine session ID. Use --session to specify.", file=sys.stderr)
         sys.exit(1)
@@ -79,8 +138,21 @@ Examples:
         # Get session metadata
         session = dq.get_session_metadata(session_id)
         if not session:
-            print(f"Error: Session not found: {session_id}", file=sys.stderr)
-            sys.exit(1)
+            # Session not in DB yet — read directly from JSONL
+            print(f"Note: Session {session_id[:8]}... not in DB. Reading from JSONL directly.", file=sys.stderr)
+            dq.close()
+            # Exec get-recent-user-messages as fallback
+            import subprocess
+            cmd = ["get-recent-user-messages"]
+            if args.user_only:
+                pass  # get-recent-user-messages only returns user messages anyway
+            if args.json:
+                cmd.append("--json")
+            else:
+                cmd.append("--compact")
+            cmd.extend(["-n", str(args.last)])
+            result = subprocess.run(cmd, capture_output=False)
+            sys.exit(result.returncode)
 
         # Get messages (we need to get all and take the last N)
         all_messages = dq.get_session_messages(
