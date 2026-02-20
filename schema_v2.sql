@@ -537,6 +537,39 @@ CREATE TRIGGER IF NOT EXISTS transcripts_au AFTER UPDATE ON transcripts BEGIN
 END;
 
 -- ============================================================================
+-- WAYBAR ICON VALIDATION TABLES
+-- ============================================================================
+
+-- Icon validation results from visual regression tests
+CREATE TABLE IF NOT EXISTS icon_validations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    screenshot_id INTEGER,  -- FK to screenshots (nullable if screenshot not ingested)
+    screenshot_path TEXT,  -- Filesystem path to the screenshot
+    test_name TEXT NOT NULL,  -- e.g., 'test_waybar_icons_visible'
+    vision_model TEXT NOT NULL,  -- e.g., 'anthropic/claude-haiku-4.5'
+    icons_found TEXT,  -- JSON array of detected icon names
+    icons_missing TEXT,  -- JSON array of missing icon names
+    all_present INTEGER,  -- Boolean: 1 if all expected icons were found
+    battery_color TEXT,  -- For battery test: detected color
+    power_profile_text TEXT,  -- For battery test: PRF/BAL/SAV
+    ac_power INTEGER,  -- Boolean: 1 if AC power connected
+    notes TEXT,  -- Model's observations
+    passed INTEGER NOT NULL,  -- Boolean: 1 if test passed
+    human_review TEXT,  -- 'ok', 'wrong', or NULL (pending)
+    source_device TEXT,  -- 'desktop', 'laptop'
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    metadata TEXT,  -- JSON for full model response
+    FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE SET NULL
+);
+
+-- Indexes for icon_validations
+CREATE INDEX IF NOT EXISTS idx_icon_validations_created ON icon_validations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_icon_validations_test ON icon_validations(test_name);
+CREATE INDEX IF NOT EXISTS idx_icon_validations_passed ON icon_validations(passed);
+CREATE INDEX IF NOT EXISTS idx_icon_validations_device ON icon_validations(source_device);
+CREATE INDEX IF NOT EXISTS idx_icon_validations_review ON icon_validations(human_review);
+
+-- ============================================================================
 -- METADATA TABLE
 -- ============================================================================
 
@@ -609,6 +642,24 @@ FROM email_threads et
 JOIN email_accounts ea ON et.account_id = ea.id
 WHERE et.is_unread = 1 OR et.is_starred = 1
 ORDER BY et.last_message_at DESC;
+
+-- View: Icon validation results with pass rate
+CREATE VIEW IF NOT EXISTS v_icon_validations AS
+SELECT
+    iv.id,
+    iv.test_name,
+    iv.vision_model,
+    iv.icons_found,
+    iv.icons_missing,
+    iv.all_present,
+    iv.passed,
+    iv.human_review,
+    iv.source_device,
+    iv.screenshot_path,
+    iv.notes,
+    iv.created_at
+FROM icon_validations iv
+ORDER BY iv.created_at DESC;
 
 -- View: Token usage by day
 CREATE VIEW IF NOT EXISTS v_token_usage_daily AS
