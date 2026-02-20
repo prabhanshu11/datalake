@@ -142,7 +142,10 @@
     .back-link { margin-bottom: 1rem; display: inline-block; }
 </style>
 
-<a href="/sessions" class="back-link">&larr; Back to Sessions</a>
+<div style="display:flex; gap:2rem; margin-bottom:1rem; align-items:center;">
+    <a href="/sessions" class="back-link" style="margin-bottom:0">&larr; Back to Sessions</a>
+    <a href="/explorer/{{ session.id }}" class="back-link" style="margin-bottom:0">&#x25C6; Open in Explorer</a>
+</div>
 
 <div class="session-header">
     <h1>Session {{ session.session_id[:8] }}...</h1>
@@ -212,9 +215,11 @@
 
         {% if msg.content_text %}
         <div class="message-content" id="content-{{ msg.message_uuid }}">{{ msg.content_text }}</div>
-        {% elif msg.content_tool_uses and msg.content_tool_uses > 0 %}
-        <div class="message-content empty-content" id="content-{{ msg.message_uuid }}">
-            ({{ msg.content_tool_uses }} tool call{{ 's' if msg.content_tool_uses > 1 else '' }} - no text response)
+        {% elif msg.tool_names %}
+        <div class="tool-uses" id="content-{{ msg.message_uuid }}">
+            {% for tn in msg.tool_names %}
+            <div class="tool-use"><span class="tool-name">{{ tn }}</span></div>
+            {% endfor %}
         </div>
         {% elif msg.content_thinking %}
         <div class="message-content empty-content" id="content-{{ msg.message_uuid }}">(Thinking only - click "Show Thinking" above)</div>

@@ -10,9 +10,10 @@ Simple Flask-based web interface for browsing and searching:
 
 import os
 import json
+import time
 import sqlite3
-from datetime import datetime
-from flask import Flask, render_template, request, jsonify, g
+from datetime import datetime, timedelta
+from flask import Flask, render_template, request, jsonify, g, Response
 from pathlib import Path
 from flask import send_from_directory
 from search.es_client import DatalakeSearch
@@ -160,6 +161,24 @@ def session_detail(session_id):
         ORDER BY sequence_number
     ''', (session['id'],)).fetchall()
 
+    # Build tool name lookups from tool_events table
+    tool_events = db.execute('''
+        SELECT message_uuid, result_message_uuid, tool_name, file_path
+        FROM claude_tool_events
+        WHERE session_id = ?
+        ORDER BY sequence_number
+    ''', (session['id'],)).fetchall()
+
+    tools_by_msg = {}       # assistant msg → tool names (tool_use)
+    tools_by_result = {}    # user msg → tool names (tool_result)
+    for te in tool_events:
+        name = te['tool_name']
+        fp = te['file_path'] or ''
+        label = name + (' ' + fp.split('/')[-1] if fp else '')
+        tools_by_msg.setdefault(te['message_uuid'], []).append(label)
+        if te['result_message_uuid']:
+            tools_by_result.setdefault(te['result_message_uuid'], []).append(label)
+
     # Convert to dicts and handle tool_uses (stored as count in DB)
     messages = []
     for msg in messages_raw:
@@ -175,6 +194,9 @@ def session_detail(session_id):
         elif tool_uses is None:
             m['content_tool_uses'] = 0
         # If it's already an int, leave it as-is
+
+        # Attach tool names for display
+        m['tool_names'] = tools_by_msg.get(m['message_uuid'], []) or tools_by_result.get(m['message_uuid'], [])
         messages.append(m)
 
     return render_template('session_detail.html',
@@ -2065,6 +2087,321 @@ print('OK')
         return jsonify({'error': 'Extraction timed out'}), 504
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
+# Conversation Explorer
+# ──────────────────────────────────────────────────────────────
+
+@app.route('/explorer')
+@app.route('/explorer/<session_id>')
+def explorer(session_id=None):
+    """Conversation Explorer — visual tree view of Claude sessions."""
+    return render_template('conversation_explorer.html',
+                           initial_session_id=session_id)
+
+
+@app.route('/api/sessions/active')
+def api_sessions_active():
+    """Return sessions modified in last 5 minutes + recent sessions for dropdown."""
+    db = get_db()
+
+    # Active sessions: check source_file modification time
+    active = []
+    recent_cutoff = (datetime.now() - timedelta(minutes=5)).isoformat()
+    active_rows = db.execute('''
+        SELECT id, session_id, summary, project_path, total_messages,
+               source_device, started_at, ended_at
+        FROM claude_sessions
+        WHERE ended_at > ?
+        ORDER BY ended_at DESC
+        LIMIT 10
+    ''', (recent_cutoff,)).fetchall()
+    for row in active_rows:
+        active.append({**dict(row), 'is_active': True})
+
+    # Recent sessions (last 50, excluding already-shown active)
+    active_ids = [r['id'] for r in active_rows]
+    placeholders = ','.join('?' * len(active_ids)) if active_ids else '0'
+    recent_rows = db.execute(f'''
+        SELECT id, session_id, summary, project_path, total_messages,
+               source_device, started_at, ended_at
+        FROM claude_sessions
+        WHERE id NOT IN ({placeholders})
+        ORDER BY started_at DESC
+        LIMIT 50
+    ''', active_ids).fetchall()
+    recent = [{**dict(row), 'is_active': False} for row in recent_rows]
+
+    return jsonify({'active': active, 'recent': recent})
+
+
+@app.route('/api/sessions/search')
+def api_sessions_search():
+    """Search sessions by message content using FTS5."""
+    db = get_db()
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({'results': []})
+
+    # Sanitize query for FTS5: remove special characters that cause syntax errors
+    safe_query = query.replace('-', ' ').replace('"', '').replace("'", '')
+    # Use FTS5 to find matching sessions
+    try:
+        rows = db.execute('''
+            SELECT DISTINCT s.id, s.session_id, s.summary, s.project_path,
+                   s.total_messages, s.source_device, s.started_at, s.ended_at
+            FROM claude_messages_fts fts
+            JOIN claude_messages m ON m.id = fts.rowid
+            JOIN claude_sessions s ON s.id = m.session_id
+            WHERE claude_messages_fts MATCH ?
+            ORDER BY s.started_at DESC
+            LIMIT 20
+        ''', (safe_query,)).fetchall()
+    except Exception:
+        # Fallback to LIKE search if FTS fails
+        rows = db.execute('''
+            SELECT DISTINCT s.id, s.session_id, s.summary, s.project_path,
+                   s.total_messages, s.source_device, s.started_at, s.ended_at
+            FROM claude_messages m
+            JOIN claude_sessions s ON s.id = m.session_id
+            WHERE m.content_text LIKE ?
+            ORDER BY s.started_at DESC
+            LIMIT 20
+        ''', (f'%{query}%',)).fetchall()
+
+    results = [{**dict(row), 'is_active': False} for row in rows]
+    return jsonify({'results': results})
+
+
+@app.route('/api/session/<int:session_id>/tree')
+def api_session_tree(session_id):
+    """Return full tree data for a session — nodes, tool events, compaction, subagents."""
+    db = get_db()
+
+    session = db.execute('''
+        SELECT id, session_id, summary, project_path, total_messages,
+               source_device, started_at, ended_at, duration_seconds,
+               total_input_tokens, total_output_tokens
+        FROM claude_sessions WHERE id = ?
+    ''', (session_id,)).fetchone()
+
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+
+    # All messages as flat list with parent links
+    messages = db.execute('''
+        SELECT message_uuid, parent_uuid, message_type, role, model,
+               is_sidechain, cwd, content_text, content_thinking,
+               content_tool_uses, content_tool_results,
+               input_tokens, output_tokens, sequence_number, timestamp
+        FROM claude_messages
+        WHERE session_id = ?
+        ORDER BY sequence_number
+    ''', (session_id,)).fetchall()
+
+    # Tool events for this session (load early so we can enrich empty nodes)
+    tool_events = db.execute('''
+        SELECT id, message_uuid, result_message_uuid, tool_use_id,
+               tool_name, is_error, file_path, sequence_number, timestamp
+        FROM claude_tool_events
+        WHERE session_id = ?
+        ORDER BY sequence_number
+    ''', (session_id,)).fetchall()
+
+    # Build tool name lookups for enriching empty content_preview
+    tools_by_msg = {}       # assistant msg uuid → list of tool names
+    tools_by_result = {}    # user (tool_result) msg uuid → list of tool names
+    for te in tool_events:
+        te_dict = dict(te)
+        msg_uuid = te_dict['message_uuid']
+        result_uuid = te_dict.get('result_message_uuid')
+        name = te_dict['tool_name']
+        fp = te_dict.get('file_path') or ''
+        label = name + (' ' + fp.split('/')[-1] if fp else '')
+        tools_by_msg.setdefault(msg_uuid, []).append(label)
+        if result_uuid:
+            tools_by_result.setdefault(result_uuid, []).append(label)
+
+    nodes = []
+    for msg in messages:
+        m = dict(msg)
+        # Truncate content for tree overview
+        text = m.pop('content_text', '') or ''
+        thinking = m.pop('content_thinking', '') or ''
+        m['has_thinking'] = bool(thinking)
+        m['tool_use_count'] = m.pop('content_tool_uses', 0) or 0
+        m['tool_result_count'] = m.pop('content_tool_results', 0) or 0
+
+        # Generate meaningful content_preview for tool-only messages
+        if text:
+            m['content_preview'] = text[:200] + ('...' if len(text) > 200 else '')
+        elif m['tool_use_count'] > 0:
+            tool_names = tools_by_msg.get(m['message_uuid'], [])
+            if tool_names:
+                m['content_preview'] = ', '.join(tool_names[:4])
+                if len(tool_names) > 4:
+                    m['content_preview'] += f' +{len(tool_names)-4} more'
+            else:
+                m['content_preview'] = f"{m['tool_use_count']} tool call{'s' if m['tool_use_count'] > 1 else ''}"
+        elif m['tool_result_count'] > 0:
+            tool_names = tools_by_result.get(m['message_uuid'], [])
+            if tool_names:
+                m['content_preview'] = '\u2190 ' + ', '.join(tool_names[:4])
+                if len(tool_names) > 4:
+                    m['content_preview'] += f' +{len(tool_names)-4} more'
+            else:
+                m['content_preview'] = f"{m['tool_result_count']} tool result{'s' if m['tool_result_count'] > 1 else ''}"
+        elif thinking:
+            m['content_preview'] = thinking[:120] + ('...' if len(thinking) > 120 else '')
+        else:
+            m['content_preview'] = ''
+        nodes.append(m)
+
+    # Compaction events
+    compaction_events = db.execute('''
+        SELECT id, leaf_uuid, summary_text, sequence_number, timestamp
+        FROM claude_compaction_events
+        WHERE session_id = ?
+        ORDER BY sequence_number
+    ''', (session_id,)).fetchall()
+
+    # Subagents
+    subagents = db.execute('''
+        SELECT id, subagent_id, subagent_type, description,
+               total_messages, started_at, ended_at
+        FROM claude_subagents
+        WHERE parent_session_id = ?
+    ''', (session_id,)).fetchall()
+
+    return jsonify({
+        'session': dict(session),
+        'nodes': nodes,
+        'tool_events': [dict(te) for te in tool_events],
+        'compaction_events': [dict(ce) for ce in compaction_events],
+        'subagents': [dict(sa) for sa in subagents]
+    })
+
+
+@app.route('/api/session/<int:session_id>/node/<message_uuid>')
+def api_session_node(session_id, message_uuid):
+    """Return full detail for a single node — content, thinking, tool I/O."""
+    db = get_db()
+
+    msg = db.execute('''
+        SELECT message_uuid, parent_uuid, message_type, role, model,
+               content_text, content_thinking, content_tool_uses,
+               content_tool_results, is_sidechain, cwd, git_branch,
+               input_tokens, output_tokens, cache_read_tokens,
+               stop_reason, timestamp, sequence_number
+        FROM claude_messages
+        WHERE session_id = ? AND message_uuid = ?
+    ''', (session_id, message_uuid)).fetchone()
+
+    if not msg:
+        return jsonify({'error': 'Node not found'}), 404
+
+    node = dict(msg)
+
+    # Full tool events for this message
+    tool_events = db.execute('''
+        SELECT tool_use_id, tool_name, tool_input, tool_result,
+               is_error, file_path, timestamp
+        FROM claude_tool_events
+        WHERE session_id = ? AND (message_uuid = ? OR result_message_uuid = ?)
+        ORDER BY sequence_number
+    ''', (session_id, message_uuid, message_uuid)).fetchall()
+    node['tool_events'] = [dict(te) for te in tool_events]
+
+    # File operations linked to tool events in this message
+    tool_event_ids = [te['tool_use_id'] for te in tool_events]
+    if tool_event_ids:
+        placeholders = ','.join('?' * len(tool_event_ids))
+        file_ops = db.execute(f'''
+            SELECT operation, file_path, content_preview,
+                   old_string, new_string, timestamp
+            FROM claude_file_operations
+            WHERE session_id = ? AND tool_event_id IN (
+                SELECT id FROM claude_tool_events
+                WHERE session_id = ? AND tool_use_id IN ({placeholders})
+            )
+            ORDER BY sequence_number
+        ''', [session_id, session_id] + tool_event_ids).fetchall()
+        node['file_operations'] = [dict(fo) for fo in file_ops]
+    else:
+        node['file_operations'] = []
+
+    return jsonify(node)
+
+
+@app.route('/api/session/<int:session_id>/stream')
+def api_session_stream(session_id):
+    """SSE stream — pushes new messages as they appear in DB."""
+    last_seq = request.args.get('last_seq', 0, type=int)
+
+    def generate():
+        nonlocal last_seq
+        # Send initial keepalive
+        yield f"data: {json.dumps({'type': 'connected', 'last_seq': last_seq})}\n\n"
+
+        while True:
+            try:
+                # New connection per poll — Flask's g doesn't work in generators
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+
+                new_messages = conn.execute('''
+                    SELECT message_uuid, parent_uuid, message_type, role,
+                           is_sidechain, content_text, content_thinking,
+                           content_tool_uses, content_tool_results,
+                           input_tokens, output_tokens,
+                           sequence_number, timestamp
+                    FROM claude_messages
+                    WHERE session_id = ? AND sequence_number > ?
+                    ORDER BY sequence_number
+                ''', (session_id, last_seq)).fetchall()
+
+                if new_messages:
+                    nodes = []
+                    for msg in new_messages:
+                        m = dict(msg)
+                        text = m.pop('content_text', '') or ''
+                        thinking = m.pop('content_thinking', '') or ''
+                        m['content_preview'] = text[:200] + ('...' if len(text) > 200 else '')
+                        m['has_thinking'] = bool(thinking)
+                        m['tool_use_count'] = m.pop('content_tool_uses', 0) or 0
+                        m['tool_result_count'] = m.pop('content_tool_results', 0) or 0
+                        nodes.append(m)
+                        last_seq = max(last_seq, m['sequence_number'] or 0)
+
+                    # Also fetch new tool events
+                    min_seq = min(n['sequence_number'] for n in nodes if n['sequence_number'])
+                    tool_events = conn.execute('''
+                        SELECT id, message_uuid, tool_use_id, tool_name,
+                               is_error, file_path, sequence_number, timestamp
+                        FROM claude_tool_events
+                        WHERE session_id = ? AND sequence_number >= ?
+                        ORDER BY sequence_number
+                    ''', (session_id, min_seq)).fetchall()
+
+                    yield f"data: {json.dumps({'type': 'new_nodes', 'nodes': nodes, 'tool_events': [dict(te) for te in tool_events]})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'last_seq': last_seq})}\n\n"
+
+                conn.close()
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+            time.sleep(3)
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',  # Disable nginx buffering
+        }
+    )
 
 
 def main():

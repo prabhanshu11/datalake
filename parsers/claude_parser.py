@@ -59,6 +59,42 @@ class ClaudeMessage:
 
 
 @dataclass
+class ToolEvent:
+    """Represents a tool invocation paired with its result."""
+    tool_use_id: str
+    tool_name: str
+    tool_input: str  # JSON
+    tool_result: Optional[str]  # Truncated to 10KB
+    is_error: bool
+    file_path: Optional[str]  # For Write/Edit/Read tools
+    message_uuid: str
+    result_message_uuid: Optional[str]
+    sequence_number: int
+    timestamp: str
+
+
+@dataclass
+class CompactionEvent:
+    """Represents a context compaction point."""
+    leaf_uuid: Optional[str]
+    summary_text: str
+    sequence_number: int
+    timestamp: Optional[str]  # Derived from surrounding messages
+
+
+@dataclass
+class FileOperation:
+    """Represents a Write/Edit operation on a code file."""
+    operation: str  # 'write' or 'edit'
+    file_path: str
+    content_preview: Optional[str]  # First 500 chars
+    old_string: Optional[str]
+    new_string: Optional[str]
+    sequence_number: int
+    timestamp: str
+
+
+@dataclass
 class ClaudeSession:
     """Represents a parsed Claude session."""
     session_id: str
@@ -82,6 +118,9 @@ class ClaudeSession:
     duration_seconds: Optional[float]
     messages: list[ClaudeMessage] = field(default_factory=list)
     subagents: list[dict] = field(default_factory=list)
+    tool_events: list[ToolEvent] = field(default_factory=list)
+    compaction_events: list[CompactionEvent] = field(default_factory=list)
+    file_operations: list[FileOperation] = field(default_factory=list)
 
 
 @dataclass
@@ -141,17 +180,19 @@ class ClaudeParser:
                 except Exception as e:
                     logger.error(f"Error processing history line {line_num}: {e}")
 
-    def _extract_content(self, message: dict) -> tuple[str, str, int, int, int]:
-        """Extract text, thinking, and counts from message content."""
+    def _extract_content(self, message: dict) -> tuple[str, str, int, int, int, list[dict], list[dict]]:
+        """Extract text, thinking, counts, tool_uses, and tool_results from message content."""
         content = message.get('content', [])
         if isinstance(content, str):
-            return content, '', 0, 0, 0
+            return content, '', 0, 0, 0, [], []
 
         text_parts = []
         thinking_parts = []
         image_count = 0
         tool_use_count = 0
         tool_result_count = 0
+        tool_uses = []
+        tool_results = []
 
         for item in content:
             if isinstance(item, str):
@@ -166,15 +207,49 @@ class ClaudeParser:
                     image_count += 1
                 elif item_type == 'tool_use':
                     tool_use_count += 1
+                    name = item.get('name', '')
+                    inp = item.get('input', {})
+                    tool_uses.append({
+                        'id': item.get('id', ''),
+                        'name': name,
+                        'input': inp,
+                    })
+                    # Add readable summary to content_text
+                    summary_parts = [f'[{name}]']
+                    for key in ('command', 'file_path', 'pattern', 'query', 'description', 'prompt', 'url', 'content'):
+                        val = inp.get(key)
+                        if val:
+                            summary_parts.append(str(val)[:200])
+                            break
+                    text_parts.append(' '.join(summary_parts))
                 elif item_type == 'tool_result':
                     tool_result_count += 1
+                    result_content = item.get('content', '')
+                    if isinstance(result_content, list):
+                        # tool_result content can be a list of blocks
+                        result_text = '\n'.join(
+                            b.get('text', '') for b in result_content
+                            if isinstance(b, dict) and b.get('type') == 'text'
+                        )
+                    else:
+                        result_text = str(result_content)
+                    tool_results.append({
+                        'tool_use_id': item.get('tool_use_id', ''),
+                        'content': result_text[:10240],  # Truncate to 10KB
+                        'is_error': item.get('is_error', False),
+                    })
+                    # Add truncated result to content_text for searchability
+                    if result_text:
+                        text_parts.append(result_text[:2000])
 
         return (
             '\n'.join(text_parts),
             '\n'.join(thinking_parts),
             image_count,
             tool_use_count,
-            tool_result_count
+            tool_result_count,
+            tool_uses,
+            tool_results,
         )
 
     def _parse_session_file(self, session_file: Path, session_id: str,
@@ -187,6 +262,7 @@ class ClaudeParser:
 
         messages: list[ClaudeMessage] = []
         summaries: list[str] = []
+        compaction_events: list[CompactionEvent] = []
         models_used: set[str] = set()
         claude_version = None
         git_branch = None
@@ -199,6 +275,12 @@ class ClaudeParser:
         assistant_count = 0
 
         timestamps: list[str] = []
+        first_user_text: Optional[str] = None  # Fallback summary from first user message
+
+        # Collect tool_uses from assistant messages, pair with tool_results from user messages
+        pending_tool_uses: dict[str, dict] = {}  # tool_use_id -> {name, input, msg_uuid, seq, ts}
+        tool_events: list[ToolEvent] = []
+        file_operations: list[FileOperation] = []
 
         with open(session_file, 'r', encoding='utf-8') as f:
             for seq_num, line in enumerate(f, 1):
@@ -207,7 +289,16 @@ class ClaudeParser:
                     msg_type = data.get('type', 'unknown')
 
                     if msg_type == 'summary':
-                        summaries.append(data.get('summary', ''))
+                        summary_text = data.get('summary', '')
+                        summaries.append(summary_text)
+                        # Derive timestamp from nearest previous message
+                        ts_approx = timestamps[-1] if timestamps else None
+                        compaction_events.append(CompactionEvent(
+                            leaf_uuid=data.get('leafUuid'),
+                            summary_text=summary_text,
+                            sequence_number=seq_num,
+                            timestamp=ts_approx,
+                        ))
                         continue
 
                     if msg_type in ('user', 'assistant'):
@@ -222,9 +313,79 @@ class ClaudeParser:
                         if not git_branch:
                             git_branch = data.get('gitBranch')
 
-                        # Extract message content
+                        # Extract message content including tool details
                         inner_msg = data.get('message', {})
-                        text, thinking, images, tools, results = self._extract_content(inner_msg)
+                        text, thinking, images, tools, results, tool_uses_raw, tool_results_raw = \
+                            self._extract_content(inner_msg)
+
+                        msg_uuid = data.get('uuid', '')
+
+                        # Capture first user message as fallback summary
+                        if msg_type == 'user' and first_user_text is None and text:
+                            first_user_text = text.strip()[:150]
+
+                        # Collect tool_use items from assistant messages
+                        if msg_type == 'assistant':
+                            for tu in tool_uses_raw:
+                                tu_id = tu['id']
+                                pending_tool_uses[tu_id] = {
+                                    'name': tu['name'],
+                                    'input': tu['input'],
+                                    'message_uuid': msg_uuid,
+                                    'sequence_number': seq_num,
+                                    'timestamp': ts,
+                                }
+
+                        # Match tool_result items from user messages to pending tool_uses
+                        if msg_type == 'user':
+                            for tr in tool_results_raw:
+                                tu_id = tr['tool_use_id']
+                                pending = pending_tool_uses.pop(tu_id, None)
+                                if pending:
+                                    tool_input_json = json.dumps(pending['input'])
+                                    tool_name = pending['name']
+
+                                    # Extract file_path for file-related tools
+                                    file_path = None
+                                    if tool_name in ('Write', 'Edit', 'Read'):
+                                        file_path = pending['input'].get('file_path')
+
+                                    te = ToolEvent(
+                                        tool_use_id=tu_id,
+                                        tool_name=tool_name,
+                                        tool_input=tool_input_json,
+                                        tool_result=tr['content'],
+                                        is_error=tr['is_error'],
+                                        file_path=file_path,
+                                        message_uuid=pending['message_uuid'],
+                                        result_message_uuid=msg_uuid,
+                                        sequence_number=pending['sequence_number'],
+                                        timestamp=pending['timestamp'],
+                                    )
+                                    tool_events.append(te)
+
+                                    # Create file operation for Write/Edit
+                                    if tool_name == 'Write':
+                                        content = pending['input'].get('content', '')
+                                        file_operations.append(FileOperation(
+                                            operation='write',
+                                            file_path=file_path or '',
+                                            content_preview=content[:500],
+                                            old_string=None,
+                                            new_string=None,
+                                            sequence_number=pending['sequence_number'],
+                                            timestamp=pending['timestamp'],
+                                        ))
+                                    elif tool_name == 'Edit':
+                                        file_operations.append(FileOperation(
+                                            operation='edit',
+                                            file_path=file_path or '',
+                                            content_preview=None,
+                                            old_string=(pending['input'].get('old_string', '') or '')[:500],
+                                            new_string=(pending['input'].get('new_string', '') or '')[:500],
+                                            sequence_number=pending['sequence_number'],
+                                            timestamp=pending['timestamp'],
+                                        ))
 
                         # Get model
                         model = inner_msg.get('model')
@@ -249,7 +410,7 @@ class ClaudeParser:
                             assistant_count += 1
 
                         msg = ClaudeMessage(
-                            message_uuid=data.get('uuid', ''),
+                            message_uuid=msg_uuid,
                             parent_uuid=data.get('parentUuid'),
                             message_type=msg_type,
                             user_type=data.get('userType'),
@@ -281,6 +442,21 @@ class ClaudeParser:
                 except Exception as e:
                     logger.error(f"Error processing line {seq_num} in {session_file}: {e}")
 
+        # Flush any unpaired tool_uses (no result received yet)
+        for tu_id, pending in pending_tool_uses.items():
+            tool_events.append(ToolEvent(
+                tool_use_id=tu_id,
+                tool_name=pending['name'],
+                tool_input=json.dumps(pending['input']),
+                tool_result=None,
+                is_error=False,
+                file_path=pending['input'].get('file_path') if pending['name'] in ('Write', 'Edit', 'Read') else None,
+                message_uuid=pending['message_uuid'],
+                result_message_uuid=None,
+                sequence_number=pending['sequence_number'],
+                timestamp=pending['timestamp'],
+            ))
+
         if not messages:
             return None
 
@@ -307,7 +483,7 @@ class ClaudeParser:
             session_id=session_id,
             project_path=project_decoded,
             project_encoded=project_path,
-            summary=summaries[0] if summaries else None,
+            summary=summaries[0] if summaries else first_user_text,
             model_primary=list(models_used)[0] if models_used else None,
             claude_version=claude_version,
             git_branch=git_branch,
@@ -323,7 +499,10 @@ class ClaudeParser:
             started_at=started_at,
             ended_at=ended_at,
             duration_seconds=duration,
-            messages=messages
+            messages=messages,
+            tool_events=tool_events,
+            compaction_events=compaction_events,
+            file_operations=file_operations,
         )
 
     def parse_sessions(self) -> Iterator[ClaudeSession]:
@@ -354,14 +533,23 @@ class ClaudeParser:
                     session_id = item.stem
                     session = self._parse_session_file(item, session_id, project_name)
                     if session:
-                        # Look for subagents in {session_id}/subagents/agent-*.jsonl
-                        subagents_dir = project_dir / session_id / "subagents"
-                        if subagents_dir.exists() and subagents_dir.is_dir():
-                            for subagent_file in subagents_dir.glob('agent-*.jsonl'):
-                                session.subagents.append({
-                                    'subagent_id': subagent_file.stem,
-                                    'source_file': str(subagent_file)
-                                })
+                        # Look for subagents in both locations:
+                        # - {session_id}/subagents/agent-*.jsonl (current Claude Code format)
+                        # - {session_id}/agent-*.jsonl (legacy format)
+                        session_subdir = project_dir / session_id
+                        if session_subdir.exists() and session_subdir.is_dir():
+                            subagents_dir = session_subdir / "subagents"
+                            search_dirs = []
+                            if subagents_dir.exists() and subagents_dir.is_dir():
+                                search_dirs.append(subagents_dir)
+                            search_dirs.append(session_subdir)  # Also check legacy path
+
+                            for search_dir in search_dirs:
+                                for subagent_file in search_dir.glob('agent-*.jsonl'):
+                                    session.subagents.append({
+                                        'subagent_id': subagent_file.stem,
+                                        'source_file': str(subagent_file)
+                                    })
 
                         yield session
 
@@ -494,7 +682,7 @@ class DatalakeIngester:
             # Insert messages
             for msg in session.messages:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO claude_messages
+                    INSERT INTO claude_messages
                     (session_id, message_uuid, parent_uuid, message_type, user_type,
                      role, model, content_text, content_thinking, content_images,
                      content_tool_uses, content_tool_results, is_sidechain, cwd,
@@ -502,6 +690,12 @@ class DatalakeIngester:
                      cache_creation_tokens, stop_reason, request_id, timestamp,
                      sequence_number, todos, metadata)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(message_uuid) DO UPDATE SET
+                        content_text = excluded.content_text,
+                        content_thinking = excluded.content_thinking,
+                        content_tool_uses = excluded.content_tool_uses,
+                        content_tool_results = excluded.content_tool_results,
+                        metadata = excluded.metadata
                 ''', (
                     session_db_id,
                     msg.message_uuid,
@@ -540,6 +734,65 @@ class DatalakeIngester:
                     session_db_id,
                     subagent['subagent_id'],
                     subagent['source_file']
+                ))
+
+            # Clear existing explorer data for this session (avoid duplicates on re-parse)
+            cursor.execute('DELETE FROM claude_tool_events WHERE session_id = ?', (session_db_id,))
+            cursor.execute('DELETE FROM claude_compaction_events WHERE session_id = ?', (session_db_id,))
+            cursor.execute('DELETE FROM claude_file_operations WHERE session_id = ?', (session_db_id,))
+
+            # Insert tool events
+            for te in session.tool_events:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO claude_tool_events
+                    (session_id, message_uuid, result_message_uuid, tool_use_id,
+                     tool_name, tool_input, tool_result, is_error, file_path,
+                     sequence_number, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    session_db_id,
+                    te.message_uuid,
+                    te.result_message_uuid,
+                    te.tool_use_id,
+                    te.tool_name,
+                    te.tool_input,
+                    te.tool_result,
+                    1 if te.is_error else 0,
+                    te.file_path,
+                    te.sequence_number,
+                    te.timestamp,
+                ))
+
+            # Insert compaction events
+            for ce in session.compaction_events:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO claude_compaction_events
+                    (session_id, leaf_uuid, summary_text, sequence_number, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    session_db_id,
+                    ce.leaf_uuid,
+                    ce.summary_text,
+                    ce.sequence_number,
+                    ce.timestamp,
+                ))
+
+            # Insert file operations
+            for fo in session.file_operations:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO claude_file_operations
+                    (session_id, operation, file_path, content_preview,
+                     old_string, new_string, sequence_number, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    session_db_id,
+                    fo.operation,
+                    fo.file_path,
+                    fo.content_preview,
+                    fo.old_string,
+                    fo.new_string,
+                    fo.sequence_number,
+                    fo.timestamp,
                 ))
 
             self.conn.commit()
