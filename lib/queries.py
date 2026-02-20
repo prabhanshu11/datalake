@@ -313,6 +313,100 @@ class DatalakeQueries:
 
         return results
 
+    def get_parent_session_id(self, session_id: str) -> Optional[str]:
+        """
+        Get the parent session UUID if this session is a Task-spawned subagent.
+
+        When Claude spawns a subagent via the Task tool, the subagent's JSONL file
+        is named 'agent-XXXX.jsonl'. This method looks up the parent via
+        claude_subagents.subagent_id matching the basename.
+
+        Returns:
+            Parent session UUID string, or None if not a subagent / parent not found.
+        """
+        import os
+        conn = self._get_conn()
+
+        row = conn.execute(
+            "SELECT source_file FROM claude_sessions WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+
+        if not row or not row["source_file"]:
+            return None
+
+        basename = os.path.basename(row["source_file"])
+        if not basename.startswith("agent-"):
+            return None
+
+        subagent_id = basename.replace(".jsonl", "")  # e.g. "agent-abc123"
+
+        parent = conn.execute("""
+            SELECT cs.session_id
+            FROM claude_subagents sub
+            JOIN claude_sessions cs ON cs.id = sub.parent_session_id
+            WHERE sub.subagent_id = ?
+        """, (subagent_id,)).fetchone()
+
+        return parent["session_id"] if parent else None
+
+    def get_user_messages_chain(
+        self,
+        session_id: str,
+        n: int = 20,
+        follow_chain: bool = True,
+        max_depth: int = 5,
+    ) -> list[dict]:
+        """
+        Collect user messages from current session and optionally its parent chain.
+
+        Walks up the Task-spawned subagent hierarchy, collecting user messages from
+        each level. Messages are merged in chronological order and clipped to the
+        last N total.
+
+        Args:
+            session_id: Starting session UUID
+            n: Total messages to return (across all levels)
+            follow_chain: If True, follow parent sessions for subagents
+            max_depth: Maximum chain levels to traverse (prevents runaway queries)
+
+        Returns:
+            List of dicts: {session_id, timestamp, text, depth}
+            depth=0 is current session, depth=1 is parent, etc.
+            Sorted chronologically, last N messages.
+        """
+        all_messages = []
+        current_id = session_id
+        depth = 0
+
+        while current_id is not None and depth <= max_depth:
+            messages = self.get_session_messages(
+                session_id=current_id,
+                message_types=["user"],
+            )
+            for m in messages:
+                if m.content_text:
+                    all_messages.append({
+                        "session_id": current_id,
+                        "timestamp": m.timestamp,
+                        "text": m.content_text,
+                        "depth": depth,
+                    })
+
+            if not follow_chain:
+                break
+
+            parent_id = self.get_parent_session_id(current_id)
+            if not parent_id:
+                break
+
+            current_id = parent_id
+            depth += 1
+
+        # Sort chronologically (oldest first) then take last N
+        all_messages.sort(key=lambda m: m["timestamp"])
+        return all_messages[-n:] if n < len(all_messages) else all_messages
+
     def get_stats(self) -> dict:
         """Get database statistics."""
         conn = self._get_conn()

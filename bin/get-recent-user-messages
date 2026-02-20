@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Read user messages from the current Claude session.
+
+Reads directly from the raw JSONL file — works for live sessions
+without waiting for DB ingestion. Falls back to DB if file not found.
+
+Usage:
+    get-recent-user-messages                    # Last 20 user messages, current session
+    get-recent-user-messages -n 5               # Last 5
+    get-recent-user-messages --compact          # Bare text, agent-optimal
+    get-recent-user-messages --json             # JSON output
+    get-recent-user-messages --follow-chain     # Include parent session (subagents)
+    get-recent-user-messages -s UUID            # Explicit session UUID
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+UUID_PATTERN = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+)
+
+
+def encode_path(path: str) -> str:
+    """Encode a filesystem path to Claude's project dir name format."""
+    return path.replace("/", "-")
+
+
+def find_project_dir() -> Path | None:
+    """Find the Claude project dir for the current working directory."""
+    cwd = os.getcwd()
+    encoded = encode_path(cwd)
+    candidate = PROJECTS_DIR / encoded
+    if candidate.exists():
+        return candidate
+
+    # Walk up the tree — Claude uses the git root or invocation dir
+    p = Path(cwd)
+    while p != p.parent:
+        p = p.parent
+        candidate = PROJECTS_DIR / encode_path(str(p))
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def find_session_file(session_id: str | None, project_dir: Path | None) -> Path | None:
+    """Locate the JSONL file for the given session, or the most recent one."""
+    if session_id and project_dir:
+        candidate = project_dir / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+
+    if project_dir and project_dir.exists():
+        # Most recently modified UUID JSONL = active session
+        candidates = [
+            f for f in project_dir.iterdir()
+            if f.is_file() and f.suffix == ".jsonl" and UUID_PATTERN.match(f.stem)
+        ]
+        if candidates:
+            return max(candidates, key=lambda f: f.stat().st_mtime)
+
+    return None
+
+
+def find_parent_file(session_file: Path) -> Path | None:
+    """
+    Detect if this session is a subagent and return the parent's JSONL file.
+
+    Subagent files live at: {project}/{parent_uuid}/subagents/agent-*.jsonl
+    Parent JSONL lives at:  {project}/{parent_uuid}.jsonl
+    """
+    # Check if we're inside a subagents/ directory
+    if session_file.parent.name != "subagents":
+        return None
+
+    # Go up: subagents/ -> {parent_uuid}/ -> {project}/
+    parent_uuid_dir = session_file.parent.parent
+    project_dir = parent_uuid_dir.parent
+    parent_file = project_dir / f"{parent_uuid_dir.name}.jsonl"
+
+    return parent_file if parent_file.exists() else None
+
+
+def read_user_messages_from_file(jsonl_file: Path, n: int | None = None) -> list[dict]:
+    """Parse user messages from a raw JSONL session file."""
+    messages = []
+    try:
+        with open(jsonl_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if d.get("type") != "user":
+                    continue
+
+                # Skip internal/sidechain messages (tool results injected by Claude)
+                if d.get("isSidechain"):
+                    continue
+
+                inner = d.get("message", {})
+                content = inner.get("content", "")
+
+                if isinstance(content, list):
+                    parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    content = "\n".join(parts)
+
+                text = content.strip() if isinstance(content, str) else ""
+                if not text:
+                    continue
+
+                messages.append({
+                    "session_id": d.get("sessionId", ""),
+                    "agent_id": d.get("agentId"),
+                    "timestamp": d.get("timestamp", ""),
+                    "text": text,
+                    "source_file": str(jsonl_file),
+                })
+
+    except OSError as e:
+        print(f"Warning: could not read {jsonl_file}: {e}", file=sys.stderr)
+
+    if n is not None:
+        return messages[-n:]
+    return messages
+
+
+def fallback_db(session_id: str | None, n: int, follow_chain: bool) -> list[dict]:
+    """Fall back to datalake DB when JSONL file not found."""
+    script_path = Path(__file__).resolve()
+    sys.path.insert(0, str(script_path.parent.parent / "lib"))
+    try:
+        from queries import DatalakeQueries
+    except ImportError:
+        return []
+
+    dq = DatalakeQueries()
+    try:
+        if not session_id:
+            sessions = dq.get_recent_sessions(limit=1)
+            if not sessions:
+                return []
+            session_id = sessions[0].session_id
+
+        result = dq.get_user_messages_chain(
+            session_id=session_id,
+            n=n,
+            follow_chain=follow_chain,
+        )
+        return [{"session_id": m["session_id"], "agent_id": None,
+                 "timestamp": m["timestamp"], "text": m["text"],
+                 "source_file": "(db)"} for m in result]
+    finally:
+        dq.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read user messages from current Claude session (JSONL-first)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    get-recent-user-messages                    # Last 20 user messages, compact
+    get-recent-user-messages -n 5               # Last 5 messages
+    get-recent-user-messages --follow-chain     # Include parent session (subagents)
+    get-recent-user-messages --json             # JSON with metadata
+    get-recent-user-messages -s UUID            # Specific session by UUID
+
+Reads from raw JSONL — works for live sessions without DB ingestion.
+""",
+    )
+    parser.add_argument("--session", "-s", help="Session UUID (default: auto-detect)")
+    parser.add_argument("--last", "-n", type=int, default=20,
+                        help="Number of messages to return (default: 20)")
+    parser.add_argument("--follow-chain", action="store_true",
+                        help="Include parent session messages (for subagents)")
+    parser.add_argument("--compact", action="store_true",
+                        help="Bare text output, minimal tokens (default for agents)")
+    parser.add_argument("--json", action="store_true",
+                        help="JSON output with full metadata")
+    args = parser.parse_args()
+
+    session_id = args.session or os.environ.get("CLAUDE_SESSION_ID")
+    project_dir = find_project_dir()
+    session_file = find_session_file(session_id, project_dir)
+
+    if session_file:
+        messages = read_user_messages_from_file(session_file)
+
+        if args.follow_chain:
+            parent_file = find_parent_file(session_file)
+            if parent_file:
+                parent_msgs = read_user_messages_from_file(parent_file)
+                # Parent messages are older — prepend them
+                messages = parent_msgs + messages
+
+        # Take last N
+        messages = messages[-args.last:] if len(messages) > args.last else messages
+
+    else:
+        # DB fallback
+        print("Note: JSONL file not found, falling back to DB", file=sys.stderr)
+        messages = fallback_db(session_id, args.last, args.follow_chain)
+
+    if not messages:
+        if args.json:
+            print(json.dumps({"messages": [], "total": 0}))
+        sys.exit(0)
+
+    if args.json:
+        print(json.dumps({"total": len(messages), "messages": messages}, indent=2))
+        return
+
+    if args.compact:
+        prev_source = None
+        for msg in messages:
+            if msg["source_file"] != prev_source and prev_source is not None:
+                print("\n--- parent session ---")
+            print(msg["text"])
+            print()
+            prev_source = msg["source_file"]
+        return
+
+    # Default: readable output
+    prev_source = None
+    for msg in messages:
+        if msg["source_file"] != prev_source:
+            ts = msg["timestamp"][:16].replace("T", " ") if msg["timestamp"] else ""
+            sid = msg["session_id"][:8] if msg["session_id"] else "?"
+            label = "parent session" if prev_source is not None else f"session {sid}..."
+            print(f"\n[{label}] {ts}")
+            prev_source = msg["source_file"]
+        print()
+        print(msg["text"])
+
+
+if __name__ == "__main__":
+    main()

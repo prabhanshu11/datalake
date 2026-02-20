@@ -354,10 +354,10 @@ class ClaudeParser:
                     session_id = item.stem
                     session = self._parse_session_file(item, session_id, project_name)
                     if session:
-                        # Look for subagents
-                        session_subdir = project_dir / session_id
-                        if session_subdir.exists() and session_subdir.is_dir():
-                            for subagent_file in session_subdir.glob('agent-*.jsonl'):
+                        # Look for subagents in {session_id}/subagents/agent-*.jsonl
+                        subagents_dir = project_dir / session_id / "subagents"
+                        if subagents_dir.exists() and subagents_dir.is_dir():
+                            for subagent_file in subagents_dir.glob('agent-*.jsonl'):
                                 session.subagents.append({
                                     'subagent_id': subagent_file.stem,
                                     'source_file': str(subagent_file)
