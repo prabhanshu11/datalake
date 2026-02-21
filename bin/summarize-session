@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+Summarize a Claude Code session for graceful recovery.
+
+Returns a context-efficient summary instead of raw messages, preventing
+context overflow in recovery sessions.
+
+Usage:
+    summarize-session UUID                       # Summarize a specific session
+    summarize-session                            # Summarize current session (CWD-based)
+    summarize-session --refresh                  # Ingest latest sessions first
+    summarize-session --include-previous 2       # Current + N-1 previous sessions
+    summarize-session UUID --full                # Raw messages (no summarization)
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Add lib to path (resolve symlinks to find actual location)
+SCRIPT_PATH = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT_PATH.parent.parent / "lib"))
+from queries import DatalakeQueries
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+DATALAKE_DIR = SCRIPT_PATH.parent.parent
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+# Threshold: sessions with total message text under this are "short"
+SHORT_SESSION_CHARS = 3000
+
+SUMMARY_PROMPT = """\
+Summarize this Claude Code conversation. Include:
+1. What was being worked on (project, feature, task)
+2. What was accomplished (completed items)
+3. What was in progress when the session ended
+4. Any active plans, files being edited, or uncommitted work
+Be concise, under 200 words. Use bullet points."""
+
+
+def format_duration(seconds: float | int | None) -> str:
+    if not seconds:
+        return "unknown"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    return f"~{hours}h {mins}m"
+
+
+def format_timestamp(ts: str | None) -> str:
+    """Extract HH:MM from an ISO timestamp."""
+    if not ts:
+        return "??:??"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except (ValueError, AttributeError):
+        # Try extracting from string directly
+        m = re.search(r"(\d{2}:\d{2})", ts)
+        return m.group(1) if m else "??:??"
+
+
+def format_date(ts: str | None) -> str:
+    """Extract YYYY-MM-DD HH:MM from an ISO timestamp."""
+    if not ts:
+        return "unknown"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, AttributeError):
+        return ts[:16] if len(ts) >= 16 else ts
+
+
+def detect_session_from_cwd() -> str | None:
+    """Detect the current session by finding the most recently modified JSONL in the CWD's project dir."""
+    cwd = os.getcwd()
+    p = Path(cwd)
+    project_dir = None
+    while True:
+        candidate = PROJECTS_DIR / str(p).replace("/", "-")
+        if candidate.exists():
+            project_dir = candidate
+            break
+        if p == p.parent:
+            break
+        p = p.parent
+
+    if not project_dir:
+        return None
+
+    candidates = [
+        f
+        for f in project_dir.iterdir()
+        if f.is_file() and f.suffix == ".jsonl" and UUID_PATTERN.match(f.stem)
+    ]
+    if not candidates:
+        return None
+
+    newest = max(candidates, key=lambda f: f.stat().st_mtime)
+    return newest.stem
+
+
+def get_previous_sessions(n: int) -> list[str]:
+    """Get the N most recent session UUIDs from CWD's project dir."""
+    cwd = os.getcwd()
+    p = Path(cwd)
+    project_dir = None
+    while True:
+        candidate = PROJECTS_DIR / str(p).replace("/", "-")
+        if candidate.exists():
+            project_dir = candidate
+            break
+        if p == p.parent:
+            break
+        p = p.parent
+
+    if not project_dir:
+        return []
+
+    candidates = [
+        f
+        for f in project_dir.iterdir()
+        if f.is_file() and f.suffix == ".jsonl" and UUID_PATTERN.match(f.stem)
+    ]
+    candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return [f.stem for f in candidates[:n]]
+
+
+def refresh_datalake():
+    """Run refresh-claude.sh to ingest latest sessions."""
+    refresh_script = DATALAKE_DIR / "scripts" / "refresh-claude.sh"
+    if not refresh_script.exists():
+        print(f"Warning: {refresh_script} not found, skipping refresh", file=sys.stderr)
+        return
+    print("Refreshing datalake...", file=sys.stderr)
+    result = subprocess.run(
+        [str(refresh_script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        print(f"Warning: refresh failed: {result.stderr[:200]}", file=sys.stderr)
+    else:
+        print("Refresh complete.", file=sys.stderr)
+
+
+def get_total_text_length(messages) -> int:
+    """Sum of all content_text lengths in a message list."""
+    return sum(len(m.content_text or "") for m in messages)
+
+
+def is_weak_summary(summary: str | None) -> bool:
+    """Check if the existing DB summary is just a truncated first message."""
+    if not summary:
+        return True
+    # Short summaries are likely auto-truncated first messages
+    if len(summary) < 150:
+        return True
+    return False
+
+
+def generate_ai_summary(session_id: str, dq: DatalakeQueries) -> str | None:
+    """Generate an AI summary via `env -u CLAUDECODE claude -p`."""
+    # Get last 50 messages for context
+    messages = dq.get_session_messages(session_id=session_id, limit=50)
+    if not messages:
+        # Try getting all messages (session might have fewer than offset)
+        messages = dq.get_session_messages(session_id=session_id)
+
+    if not messages:
+        return None
+
+    # Take the last 50
+    messages = messages[-50:]
+
+    # Build conversation text for summarization
+    lines = []
+    for m in messages:
+        role = (m.role or m.message_type or "unknown").upper()
+        ts = format_timestamp(m.timestamp)
+        text = m.content_text or ""
+        # Truncate individual messages to keep prompt reasonable
+        if len(text) > 800:
+            text = text[:800] + "...[truncated]"
+        lines.append(f"[{ts}] {role}: {text}")
+
+    conversation_text = "\n".join(lines)
+
+    # Pipe to claude -p for summarization
+    try:
+        result = subprocess.run(
+            ["env", "-u", "CLAUDECODE", "claude", "-p", SUMMARY_PROMPT],
+            input=conversation_text,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        else:
+            print(
+                f"Warning: claude -p failed (rc={result.returncode}): {result.stderr[:200]}",
+                file=sys.stderr,
+            )
+            return None
+    except FileNotFoundError:
+        print("Warning: 'claude' CLI not found, cannot generate AI summary", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("Warning: claude -p timed out after 120s", file=sys.stderr)
+        return None
+
+
+def cache_summary(session_id: str, summary: str):
+    """Write the generated summary back to claude_sessions.summary."""
+    db_path = DATALAKE_DIR / "datalake.db"
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE claude_sessions SET summary = ? WHERE session_id = ?",
+            (summary, session_id),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        print(f"Warning: could not cache summary: {e}", file=sys.stderr)
+
+
+def find_active_plan(session_id: str) -> str | None:
+    """Check for recent plan files that might be associated with this session."""
+    plans_dir = CLAUDE_DIR / "plans"
+    if not plans_dir.exists():
+        return None
+    plan_files = sorted(plans_dir.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True)
+    if plan_files:
+        return str(plan_files[0])
+    return None
+
+
+def output_session_summary(session_id: str, dq: DatalakeQueries, full_mode: bool = False):
+    """Output a formatted summary for one session."""
+    session = dq.get_session_metadata(session_id)
+
+    if not session:
+        print(f"Session {session_id} not found in DB.", file=sys.stderr)
+        print(f"Try: summarize-session --refresh {session_id}", file=sys.stderr)
+        return False
+
+    # Full mode: dump raw messages
+    if full_mode:
+        messages = dq.get_session_messages(session_id=session_id)
+        messages = messages[-50:]
+        print(f"\n## Session: {session_id[:8]}...")
+        print(f"Started: {format_date(session.started_at)} | Messages: {session.total_messages} | Duration: {format_duration(session.duration_seconds)}")
+        print(f"Project: {session.project_path}\n")
+        for m in messages:
+            role = (m.role or m.message_type or "?").upper()
+            ts = format_timestamp(m.timestamp)
+            text = m.content_text or ""
+            if len(text) > 1000:
+                text = text[:1000] + "...[truncated]"
+            print(f"---\n[{ts}] **{role}**: {text}\n")
+        return True
+
+    # Get all messages to check total size
+    all_messages = dq.get_session_messages(session_id=session_id)
+    total_chars = get_total_text_length(all_messages)
+
+    # Header
+    print(f"\n## Session: {session_id[:8]}...")
+    print(f"Started: {format_date(session.started_at)} | Messages: {session.total_messages} | Duration: {format_duration(session.duration_seconds)}")
+    print(f"Project: {session.project_path}")
+
+    # Summary section
+    print(f"\n### Summary")
+
+    if total_chars < SHORT_SESSION_CHARS:
+        # Short session: return messages directly
+        print(f"*(Short session — showing messages directly)*\n")
+        for m in all_messages:
+            role = (m.role or m.message_type or "?").upper()
+            ts = format_timestamp(m.timestamp)
+            text = m.content_text or ""
+            print(f"[{ts}] **{role}**: {text}")
+    else:
+        # Long session: use or generate summary
+        summary = session.summary
+        if is_weak_summary(summary):
+            print(f"Generating AI summary...", file=sys.stderr)
+            ai_summary = generate_ai_summary(session_id, dq)
+            if ai_summary:
+                summary = ai_summary
+                cache_summary(session_id, summary)
+                print(f"Summary cached to DB.", file=sys.stderr)
+
+        if summary:
+            print(summary)
+        else:
+            print("*(Could not generate summary — showing last 5 user messages)*")
+
+    # Last 5 user messages with timestamps
+    user_messages = dq.get_session_messages(
+        session_id=session_id, message_types=["user"]
+    )
+    last_user = user_messages[-5:] if len(user_messages) > 5 else user_messages
+    if last_user:
+        print(f"\n### Last {len(last_user)} user messages")
+        for m in last_user:
+            ts = format_timestamp(m.timestamp)
+            text = (m.content_text or "")[:150]
+            if len(m.content_text or "") > 150:
+                text += "..."
+            print(f"- [{ts}] {text}")
+
+    # Active plan file
+    plan_file = find_active_plan(session_id)
+    if plan_file:
+        print(f"\n### Active plan file")
+        print(f"`{plan_file}`")
+
+    # Navigation commands
+    print(f"\n### Navigation")
+    print(f"  Full messages:  get-messages-from-current --session {session_id} --last 50")
+    print(f"  User only:      get-messages-from-current --session {session_id} --user-only --last 40")
+    print(f"  Resume:         claude --resume {session_id}")
+    print(f"  Search within:  find-conversations \"keyword\" --limit 5")
+
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Summarize a Claude Code session for recovery",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+    summarize-session UUID                       # Summarize a specific session
+    summarize-session                            # Summarize current session (CWD-based)
+    summarize-session --refresh                  # Ingest latest, then summarize current
+    summarize-session --include-previous 2       # Current + previous session
+    summarize-session UUID --full                # Raw messages, no summarization
+""",
+    )
+    parser.add_argument("session_id", nargs="?", help="Session UUID (default: auto-detect from CWD)")
+    parser.add_argument("--refresh", action="store_true", help="Run refresh-claude.sh before summarizing")
+    parser.add_argument("--full", action="store_true", help="Output raw messages instead of summary")
+    parser.add_argument(
+        "--include-previous",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Summarize N most recent sessions (default: 1 = current only)",
+    )
+    args = parser.parse_args()
+
+    # Step 1: Refresh if requested
+    if args.refresh:
+        refresh_datalake()
+
+    # Step 2: Resolve session ID(s)
+    n_sessions = max(1, args.include_previous)
+
+    if args.session_id:
+        session_ids = [args.session_id]
+    elif n_sessions > 1:
+        session_ids = get_previous_sessions(n_sessions)
+        if not session_ids:
+            print("Error: Could not detect sessions from CWD. Use --session UUID.", file=sys.stderr)
+            sys.exit(1)
+        # Reverse so oldest is first
+        session_ids.reverse()
+    else:
+        current = detect_session_from_cwd()
+        if not current:
+            print("Error: Could not detect current session from CWD. Use a session UUID argument.", file=sys.stderr)
+            sys.exit(1)
+        session_ids = [current]
+
+    # Step 3: Output summaries
+    dq = DatalakeQueries()
+    try:
+        for i, sid in enumerate(session_ids):
+            if i > 0:
+                print("\n" + "=" * 60 + "\n")
+            success = output_session_summary(sid, dq, full_mode=args.full)
+            if not success and not args.refresh:
+                print(f"\nHint: Session may not be ingested yet. Try: summarize-session --refresh {sid}", file=sys.stderr)
+    finally:
+        dq.close()
+
+
+if __name__ == "__main__":
+    main()
