@@ -32,6 +32,8 @@ DB_PATH = os.environ.get('DATALAKE_DB',
     str(Path.home() / 'Programs' / 'datalake' / 'datalake.db'))
 LOCAL_FILES_DB = os.environ.get('FILES_DB',
     str(Path.home() / 'Programs' / 'takeout-parser' / 'local-index.db'))
+DELETION_LOG_DB = os.environ.get('DELETION_LOG_DB',
+    str(Path.home() / 'Programs' / 'utilities' / 'google-download' / 'deletion' / 'deletion_log.db'))
 
 
 def get_db():
@@ -52,6 +54,66 @@ def get_files_db():
     return g.files_db
 
 
+def log_action(action, scope, payload):
+    """Append-only action log inside datalake.db (gets backed up via the standard sync).
+
+    action: short verb ('photo_review_set', 'deletion_status_set', ...)
+    scope:  e.g. 'photos:2018:03' or 'photos:file_id=1042'
+    payload: dict; serialized as JSON
+    """
+    try:
+        conn = get_db()  # datalake.db
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS action_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              action TEXT NOT NULL,
+              scope TEXT,
+              payload TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO action_log (action, scope, payload) VALUES (?, ?, ?)",
+            (action, scope, json.dumps(payload, default=str))
+        )
+        conn.commit()
+    except Exception as e:
+        app.logger.warning(f"action_log write failed: {e}")
+
+
+def get_deletion_db():
+    """Get deletion-log database connection. Creates schema if missing."""
+    if 'deletion_db' not in g:
+        Path(DELETION_LOG_DB).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DELETION_LOG_DB)
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deletion_log (
+              year INTEGER NOT NULL,
+              month INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              count_local INTEGER,
+              count_google INTEGER,
+              bytes_freed INTEGER,
+              deleted_at TEXT,
+              note TEXT,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (year, month)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS photo_review (
+              file_id INTEGER PRIMARY KEY,
+              status TEXT NOT NULL DEFAULT 'pending',
+              note TEXT,
+              reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        g.deletion_db = conn
+    return g.deletion_db
+
+
 @app.teardown_appcontext
 def close_db(error):
     """Close database connections at end of request."""
@@ -61,6 +123,9 @@ def close_db(error):
     files_db = g.pop('files_db', None)
     if files_db is not None:
         files_db.close()
+    deletion_db = g.pop('deletion_db', None)
+    if deletion_db is not None:
+        deletion_db.close()
 
 
 @app.route('/audio/<path:filename>')
@@ -1648,14 +1713,33 @@ METADATA_EXTENSIONS = {'.json'}
 
 
 def _parse_date_from_filename(filename):
-    """Extract (year, month) from filename like IMG_20251207_174455917.jpg.
+    """Extract (year, month) from filename. Handles:
+       - IMG_20251207_174455917.jpg (compact YYYYMMDD)
+       - Screenshot_2018-03-09-23-13-23.png (dashed YYYY-MM-DD)
     Returns (year_str, month_int) or (None, None) if unparseable."""
     import re
-    # Match IMG_YYYYMMDD or DSCF patterns, or Screenshot_YYYYMMDD
+    # Try dashed form first (more specific)
+    m = re.search(r'(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])', filename)
+    if m:
+        return m.group(1), int(m.group(2))
+    # Compact form (IMG_YYYYMMDD…)
     m = re.search(r'(\d{4})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', filename)
     if m:
         return m.group(1), int(m.group(2))
     return None, None
+
+
+def _photo_year_month(file):
+    """Return (year_str, month_int) for a file dict.
+    Prefers JSON sidecar taken_at (photos.taken_at column, ISO 8601);
+    falls back to filename pattern. Returns (None, None) if neither works."""
+    taken_at = file.get('taken_at')
+    if taken_at and len(taken_at) >= 7:
+        try:
+            return taken_at[:4], int(taken_at[5:7])
+        except (ValueError, TypeError):
+            pass
+    return _parse_date_from_filename(file.get('filename', ''))
 
 
 def _parse_year_from_folder(path):
@@ -1775,8 +1859,11 @@ def _query_photos_local(db, year=None, month=None, view='photos'):
     where_sql = ' AND '.join(where_parts)
 
     files = db.execute(f'''
-        SELECT path, filename, extension, size_bytes, source_archive, extracted, extracted_path
-        FROM files WHERE {where_sql} ORDER BY filename
+        SELECT f.id, f.path, f.filename, f.extension, f.size_bytes, f.source_archive,
+               f.extracted, f.extracted_path, p.taken_at
+        FROM files f LEFT JOIN photos p ON p.file_id = f.id
+        WHERE {where_sql}
+        ORDER BY COALESCE(p.taken_at, f.filename)
     ''').fetchall()
 
     return [dict(f) for f in files]
@@ -1824,8 +1911,8 @@ def _pair_photo_files(files, month=None):
         base = os.path.splitext(fname)[0]
         key = (fdir, base)
 
-        # Parse date for month counting
-        year_str, month_num = _parse_date_from_filename(fname)
+        # Parse date for month counting (taken_at preferred, filename fallback)
+        year_str, month_num = _photo_year_month(f)
         if month_num:
             month_counter[month_num] += 1
 
@@ -1853,7 +1940,7 @@ def _pair_photo_files(files, month=None):
             continue
 
         if month:
-            _, file_month = _parse_date_from_filename(primary['filename'])
+            _, file_month = _photo_year_month(primary)
             if file_month != month:
                 continue
 
@@ -1901,6 +1988,41 @@ def _get_photo_years_pi_nas():
         return []
 
 
+def _photo_month_counts(db, year):
+    """Per-month FILE count for a year (raw, no dedup).
+
+    Counts every file with source_service='photos' under 'Photos from <year>',
+    bucketed by month from taken_at, falling back to filename date pattern.
+    Includes photos, RAW, and videos. Edited copies (-edited.jpg) ARE counted —
+    the grid dedupes them visually, but the count reflects files-on-disk."""
+    if not db or not year:
+        return {}
+    all_exts = PHOTO_EXTENSIONS | RAW_EXTENSIONS | VIDEO_EXTENSIONS
+    ext_list = "','".join(all_exts)
+    rows = db.execute(f"""
+        SELECT f.filename, p.taken_at
+        FROM files f LEFT JOIN photos p ON p.file_id = f.id
+        WHERE f.source_service='photos'
+          AND lower(f.extension) IN ('{ext_list}')
+          AND f.path LIKE ?
+    """, (f'%Photos from {year}%',)).fetchall()
+
+    counts = {}
+    for r in rows:
+        month = None
+        if r['taken_at'] and len(r['taken_at']) >= 7:
+            try:
+                month = int(r['taken_at'][5:7])
+            except ValueError:
+                month = None
+        if not month:
+            _, m = _parse_date_from_filename(r['filename'])
+            month = m
+        if month:
+            counts[month] = counts.get(month, 0) + 1
+    return counts
+
+
 def _get_photo_years_local(db):
     """Get list of years with photo counts from local DB."""
     rows = db.execute("""
@@ -1927,44 +2049,34 @@ def photos_browser():
     page = request.args.get('page', 1, type=int)
     per_page = 100
 
-    # Try Pi NAS first (has all 5 photo archives), fall back to local
-    pi_reachable = False
+    # Local DB now contains all 5 photo archives (merged from Pi5 indexing).
     files = []
     years = []
-    data_source = 'none'
+    data_source = 'merged-local'
+    pi_reachable = True  # legacy var kept truthy so the warning banner stays hidden
 
-    # Get years list
-    pi_ssh = NODES['pi-nas']['ssh_alias']
-    pi_reachable = check_node_reachable(pi_ssh, use_ssh=True)
-
-    if pi_reachable:
-        years = _get_photo_years_pi_nas()
-        data_source = 'pi-nas'
-    else:
-        db = get_files_db()
-        if db:
-            years = _get_photo_years_local(db)
-            data_source = 'local'
+    db = get_files_db()
+    if db:
+        years = _get_photo_years_local(db)
 
     # Default to latest year
     if not year and years:
         year = years[-1]['year']
 
-    # Get files for selected year
-    if pi_reachable:
-        files, total_raw, _ = _query_photos_pi_nas(year=year, month=None, view=view)
-    else:
-        db = get_files_db()
-        if db:
-            files = _query_photos_local(db, year=year, month=None, view=view)
+    if db:
+        files = _query_photos_local(db, year=year, month=None, view=view)
 
     # Pair files and get month counts
     if view == 'photos':
-        paired, month_counts = _pair_photo_files(files, month=month if month else None)
-        # Paginate paired results
-        total_paired = len(paired)
-        start = (page - 1) * per_page
-        paired_page = paired[start:start + per_page]
+        # NEW: unified count via _photo_month_counts (same source-of-truth as /api/photos/list).
+        # Pair function still used to render the legacy table for old views, but for photos view
+        # we don't need it — the grid fetches from /api/photos/list directly.
+        month_counts = _photo_month_counts(db, year)
+        paired_page = []  # grid renders client-side via API
+        if month:
+            total_paired = month_counts.get(int(month), 0)
+        else:
+            total_paired = sum(month_counts.values())
     elif view == 'videos':
         paired, month_counts = _pair_photo_files(files, month=month if month else None)
         # For videos tab, only show rows that have a video
@@ -1980,33 +2092,37 @@ def photos_browser():
         start = (page - 1) * per_page
         paired_page = paired_page[start:start + per_page]
 
-    # Count files per view for tab badges
+    # Count files per view for tab badges (local DB only)
     view_counts = {'photos': 0, 'videos': 0, 'other': 0}
-    if pi_reachable:
-        import subprocess
+    if db:
         for v, exts in [('photos', PHOTO_EXTENSIONS | RAW_EXTENSIONS), ('videos', VIDEO_EXTENSIONS)]:
             ext_list = "','".join(exts)
-            sql = f"SELECT COUNT(*) FROM files WHERE source_service='photos' AND path LIKE '%Photos from {year}%' AND extension IN ('{ext_list}');"
-            try:
-                proc = subprocess.run(
-                    ['ssh', '-o', 'ConnectTimeout=3', pi_ssh,
-                     f'sqlite3 {PI_FILES_DB} "{sql}"'],
-                    capture_output=True, text=True, timeout=10
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    view_counts[v] = int(proc.stdout.strip())
-            except Exception:
-                pass
-    else:
-        db = get_files_db()
-        if db:
-            for v, exts in [('photos', PHOTO_EXTENSIONS | RAW_EXTENSIONS), ('videos', VIDEO_EXTENSIONS)]:
-                ext_list = "','".join(exts)
-                row = db.execute(f"""
-                    SELECT COUNT(*) FROM files
-                    WHERE source_service='photos' AND path LIKE ? AND extension IN ('{ext_list}')
-                """, (f'%Photos from {year}%',)).fetchone()
-                view_counts[v] = row[0] if row else 0
+            row = db.execute(f"""
+                SELECT COUNT(*) FROM files
+                WHERE source_service='photos' AND path LIKE ? AND extension IN ('{ext_list}')
+            """, (f'%Photos from {year}%',)).fetchone()
+            view_counts[v] = row[0] if row else 0
+
+    # Deletion-tracking state for the year (and current month detail)
+    deletion_status_map = {}
+    current_deletion = None
+    try:
+        ddb = get_deletion_db()
+        if year:
+            for r in ddb.execute(
+                "SELECT month, status FROM deletion_log WHERE year = ?",
+                (int(year),)
+            ).fetchall():
+                deletion_status_map[r['month']] = r['status']
+        if year and month:
+            row = ddb.execute(
+                "SELECT * FROM deletion_log WHERE year = ? AND month = ?",
+                (int(year), int(month))
+            ).fetchone()
+            if row:
+                current_deletion = dict(row)
+    except Exception as e:
+        app.logger.warning(f"deletion_log query failed: {e}")
 
     return render_template('photos_browser.html',
                            paired=paired_page,
@@ -2020,7 +2136,371 @@ def photos_browser():
                            page=page,
                            per_page=per_page,
                            data_source=data_source,
-                           pi_reachable=pi_reachable)
+                           pi_reachable=pi_reachable,
+                           deletion_status_map=deletion_status_map,
+                           current_deletion=current_deletion)
+
+
+@app.route('/api/photos/review', methods=['GET'])
+def photos_review_get():
+    """Return {file_id: {status, note}} for a list of file_ids.
+    Query: ?ids=1,2,3 (comma-separated)"""
+    ids_str = request.args.get('ids', '')
+    if not ids_str:
+        return jsonify({})
+    try:
+        ids = [int(x) for x in ids_str.split(',') if x]
+    except ValueError:
+        return jsonify({'error': 'invalid ids'}), 400
+    if not ids:
+        return jsonify({})
+    ddb = get_deletion_db()
+    placeholders = ','.join('?' * len(ids))
+    rows = ddb.execute(
+        f"SELECT file_id, status, note, reviewed_at FROM photo_review WHERE file_id IN ({placeholders})",
+        ids
+    ).fetchall()
+    return jsonify({str(r['file_id']): {'status': r['status'], 'note': r['note'], 'reviewed_at': r['reviewed_at']} for r in rows})
+
+
+@app.route('/api/photos/review', methods=['POST'])
+def photos_review_set():
+    """Bulk upsert photo_review rows.
+    Body: {file_ids: [int, ...], status: str, note: str (optional)}"""
+    data = request.get_json() or {}
+    file_ids = data.get('file_ids') or []
+    status = data.get('status', 'reviewed')
+    note = data.get('note')  # None means do not change existing note
+
+    if not file_ids:
+        return jsonify({'error': 'file_ids required'}), 400
+    if status not in ('pending', 'reviewed', 'flagged', 'keep'):
+        return jsonify({'error': 'invalid status'}), 400
+    file_ids = [int(x) for x in file_ids]
+
+    ddb = get_deletion_db()
+    if note is None:
+        # Don't overwrite note if not provided
+        for fid in file_ids:
+            ddb.execute("""
+                INSERT INTO photo_review (file_id, status, reviewed_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    status = excluded.status,
+                    reviewed_at = CURRENT_TIMESTAMP
+            """, (fid, status))
+    else:
+        for fid in file_ids:
+            ddb.execute("""
+                INSERT INTO photo_review (file_id, status, note, reviewed_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    status = excluded.status,
+                    note = excluded.note,
+                    reviewed_at = CURRENT_TIMESTAMP
+            """, (fid, status, note))
+    ddb.commit()
+    log_action('photo_review_set',
+               f'photos:n={len(file_ids)}',
+               {'file_ids': file_ids, 'status': status, 'note': note})
+    return jsonify({'updated': len(file_ids), 'status': status})
+
+
+@app.route('/api/photos/full/<int:file_id>')
+def photo_full(file_id):
+    """Stream full-size image straight from its zip archive (laptop-side only).
+    For Pi5-side zips (9-001/002/003), returns 503 — uses thumb."""
+    db = get_files_db()
+    if not db:
+        return "no DB", 503
+    row = db.execute(
+        "SELECT path, source_archive, extension FROM files WHERE id = ?", (file_id,)
+    ).fetchone()
+    if not row:
+        return "not found", 404
+
+    # Resolve archive to local path. Laptop has 9-004/005 in ~/Downloads/.
+    local_zip = Path.home() / 'Downloads' / row['source_archive']
+    if not local_zip.exists():
+        return jsonify({'error': 'archive not on this host', 'archive': row['source_archive']}), 503
+
+    import zipfile, mimetypes
+    ext = (row['extension'] or '').lower()
+    mime = mimetypes.guess_type(row['path'])[0] or 'application/octet-stream'
+    if ext in ('.heic', '.heif'):
+        mime = 'image/heic'  # browsers won't render but it's accurate
+
+    def gen():
+        with zipfile.ZipFile(local_zip) as z:
+            with z.open(row['path']) as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+
+    return Response(gen(), mimetype=mime,
+                    headers={'Cache-Control': 'public, max-age=3600'})
+
+
+@app.route('/api/photos/list')
+def photos_list_api():
+    """Paginated JSON list of photos for a (year, month).
+    Used by the infinite-scroll grid in photos_browser.html.
+
+    Query params:
+        year (str, required), month (int, optional 1-12),
+        offset (int, default 0), limit (int, default 200, max 500)
+    Returns: {items: [{file_id, filename, taken_at, size_bytes,
+                       source_archive, extracted, has_thumb, ext}], offset, limit}
+    """
+    year = request.args.get('year', '')
+    month = request.args.get('month', 0, type=int)
+    offset = max(0, request.args.get('offset', 0, type=int))
+    limit = min(500, max(1, request.args.get('limit', 200, type=int)))
+    order = request.args.get('order', 'asc').lower()
+    if order not in ('asc', 'desc'):
+        order = 'asc'
+
+    if not year:
+        return jsonify({'error': 'year required'}), 400
+
+    db = get_files_db()
+    if not db:
+        return jsonify({'error': 'no files DB'}), 503
+
+    photo_exts = "','".join(PHOTO_EXTENSIONS | RAW_EXTENSIONS | VIDEO_EXTENSIONS)
+
+    where = ["f.source_service = 'photos'",
+             f"lower(f.extension) IN ('{photo_exts}')",
+             "f.path LIKE ?"]
+    params = [f'%Photos from {year}%']
+
+    if month:
+        # Match by taken_at (ISO YYYY-MM-...) OR by filename containing
+        # YYYYMMDD (IMG_*) OR YYYY-MM-DD (Screenshot_*)
+        where.append(
+            "(substr(p.taken_at, 6, 2) = ? OR "
+            " (p.taken_at IS NULL AND "
+            "  (f.filename GLOB ? OR f.filename GLOB ?)))"
+        )
+        params.append(f'{month:02d}')
+        params.append(f'*{year}{month:02d}*')         # IMG_YYYYMMDD…
+        params.append(f'*{year}-{month:02d}-*')       # Screenshot_YYYY-MM-DD…
+
+    where_sql = ' AND '.join(where)
+    # Sort key: taken_at if present, else reconstruct YYYY-MM-DD from IMG_YYYYMMDD,
+    # else fall back to filename. Direction is parametrized.
+    sort_dir = 'DESC' if order == 'desc' else 'ASC'
+    sql = f"""
+        SELECT f.id, f.filename, f.extension, f.size_bytes, f.source_archive,
+               f.extracted, p.taken_at
+        FROM files f LEFT JOIN photos p ON p.file_id = f.id
+        WHERE {where_sql}
+        ORDER BY COALESCE(
+            p.taken_at,
+            -- IMG_YYYYMMDD_*: pull YYYY-MM-DD out of compact date
+            CASE WHEN f.filename GLOB '*_????????_*' THEN
+                substr(f.filename, instr(f.filename, '_')+1, 4) || '-' ||
+                substr(f.filename, instr(f.filename, '_')+5, 2) || '-' ||
+                substr(f.filename, instr(f.filename, '_')+7, 2)
+            -- Screenshot_YYYY-MM-DD-…: dashed form, take first 10 chars after first '_'
+            WHEN f.filename GLOB '*_????-??-??-*' THEN
+                substr(f.filename, instr(f.filename, '_')+1, 10)
+            ELSE f.filename END
+        ) {sort_dir}, f.id {sort_dir}
+        LIMIT ? OFFSET ?
+    """
+    params.extend([limit, offset])
+    rows = db.execute(sql, params).fetchall()
+
+    thumbs_dir = Path(app.static_folder) / 'thumbs'
+
+    # Dedupe -edited siblings: if foo-edited.jpg and foo.jpg both exist in same archive,
+    # hide the -edited one and attach its file_id to the original as edit_file_ids.
+    import re
+    raw_items = []
+    edit_index = {}  # (archive, base, ext) -> edit row
+    for r in rows:
+        m = re.match(r'^(.+)-edited(\.[^.]+)$', r['filename'])
+        if m:
+            edit_index[(r['source_archive'], m.group(1), m.group(2).lower())] = r
+        else:
+            raw_items.append(r)
+
+    items = []
+    for r in raw_items:
+        base, ext = (r['filename'].rsplit('.', 1) + [''])[:2]
+        edit = edit_index.pop((r['source_archive'], base, '.' + ext.lower()), None)
+        edit_ids = [edit['id']] if edit else []
+        thumb_path = thumbs_dir / f"{r['id']}.jpg"
+        items.append({
+            'file_id': r['id'],
+            'filename': r['filename'],
+            'ext': (r['extension'] or '').lower(),
+            'taken_at': r['taken_at'],
+            'size_bytes': r['size_bytes'],
+            'source_archive': (r['source_archive'] or '').replace('takeout-20260126T191854Z-', ''),
+            'extracted': bool(r['extracted']),
+            'has_thumb': thumb_path.exists(),
+            'edit_file_ids': edit_ids,  # files merged into this tile (edits)
+        })
+    # Any orphan edits (no matching original in this page) become standalone tiles
+    for (arch, base, ext), e in edit_index.items():
+        thumb_path = thumbs_dir / f"{e['id']}.jpg"
+        items.append({
+            'file_id': e['id'],
+            'filename': e['filename'],
+            'ext': (e['extension'] or '').lower(),
+            'taken_at': e['taken_at'],
+            'size_bytes': e['size_bytes'],
+            'source_archive': (e['source_archive'] or '').replace('takeout-20260126T191854Z-', ''),
+            'extracted': bool(e['extracted']),
+            'has_thumb': thumb_path.exists(),
+            'edit_file_ids': [],
+        })
+    return jsonify({'items': items, 'offset': offset, 'limit': limit, 'returned': len(items)})
+
+
+@app.route('/files/zips')
+def zips_overview():
+    """Per-archive overview: size, file counts by type, taken_at date range, services, extracted."""
+    db = get_files_db()
+    if not db:
+        return "No files DB available", 503
+
+    photo_exts = "','".join(PHOTO_EXTENSIONS | RAW_EXTENSIONS)
+    video_exts = "','".join(VIDEO_EXTENSIONS)
+
+    rows = db.execute(f"""
+        SELECT
+            a.filename,
+            a.size_bytes,
+            a.file_count,
+            a.indexed_at,
+            (SELECT COUNT(*) FROM files f WHERE f.source_archive = a.filename
+                AND lower(f.extension) IN ('{photo_exts}')) AS photos,
+            (SELECT COUNT(*) FROM files f WHERE f.source_archive = a.filename
+                AND lower(f.extension) IN ('{video_exts}')) AS videos,
+            (SELECT COUNT(*) FROM files f WHERE f.source_archive = a.filename
+                AND lower(f.extension) NOT IN ('{photo_exts}','{video_exts}','.json')) AS other,
+            (SELECT COUNT(*) FROM files f WHERE f.source_archive = a.filename AND f.extracted = 1) AS extracted,
+            (SELECT MIN(p.taken_at) FROM photos p JOIN files f ON p.file_id = f.id
+                WHERE f.source_archive = a.filename AND p.taken_at IS NOT NULL) AS date_min,
+            (SELECT MAX(p.taken_at) FROM photos p JOIN files f ON p.file_id = f.id
+                WHERE f.source_archive = a.filename AND p.taken_at IS NOT NULL) AS date_max
+        FROM archives a
+        ORDER BY a.filename
+    """).fetchall()
+
+    archives = []
+    total_files = total_photos = total_bytes = 0
+    for r in rows:
+        # Top 5 years by file count for this archive
+        ty = db.execute(f"""
+            SELECT
+                CASE WHEN path LIKE '%Photos from%'
+                    THEN substr(path, instr(path, 'Photos from ') + 12, 4)
+                    ELSE 'other' END AS year,
+                COUNT(*) AS cnt
+            FROM files
+            WHERE source_archive = ? AND extension NOT IN ('.json')
+            GROUP BY year ORDER BY cnt DESC LIMIT 5
+        """, (r['filename'],)).fetchall()
+        top_years = [(y['year'], y['cnt']) for y in ty]
+
+        # Services in this archive
+        svc = db.execute("""
+            SELECT source_service, COUNT(*) AS cnt FROM files
+            WHERE source_archive = ?
+            GROUP BY source_service ORDER BY cnt DESC LIMIT 5
+        """, (r['filename'],)).fetchall()
+        services = [(s['source_service'] or 'unknown', s['cnt']) for s in svc]
+
+        archives.append({
+            'short_name': r['filename'].replace('takeout-20260126T191854Z-', '').replace('.zip', ''),
+            'size_bytes': r['size_bytes'] or 0,
+            'file_count': r['file_count'] or 0,
+            'photos': r['photos'] or 0,
+            'videos': r['videos'] or 0,
+            'other': r['other'] or 0,
+            'extracted': r['extracted'] or 0,
+            'date_min': (r['date_min'] or '')[:10],
+            'date_max': (r['date_max'] or '')[:10],
+            'indexed_at': (r['indexed_at'] or '')[:10],
+            'top_years': top_years,
+            'services': services,
+        })
+        total_bytes += r['size_bytes'] or 0
+        total_files += r['file_count'] or 0
+        total_photos += r['photos'] or 0
+
+    return render_template('zips_overview.html',
+                           archives=archives,
+                           total_archives=len(archives),
+                           total_bytes=total_bytes,
+                           total_files=total_files,
+                           total_photos=total_photos)
+
+
+@app.route('/api/deletion/status', methods=['GET'])
+def deletion_status_get():
+    """Read deletion log row for (year, month). Returns null if no row."""
+    year = request.args.get('year', type=int)
+    month = request.args.get('month', type=int)
+    if not year or not month:
+        return jsonify({'error': 'year and month required'}), 400
+    ddb = get_deletion_db()
+    row = ddb.execute(
+        "SELECT * FROM deletion_log WHERE year = ? AND month = ?",
+        (year, month)
+    ).fetchone()
+    return jsonify(dict(row) if row else None)
+
+
+@app.route('/api/deletion/status', methods=['POST'])
+def deletion_status_set():
+    """Upsert deletion log row."""
+    data = request.get_json() or {}
+    year = data.get('year')
+    month = data.get('month')
+    status = data.get('status', 'pending')
+    if not year or not month:
+        return jsonify({'error': 'year and month required'}), 400
+    if status not in ('pending', 'reviewed', 'deleted', 'verified'):
+        return jsonify({'error': 'invalid status'}), 400
+
+    count_local = data.get('count_local')
+    count_google = data.get('count_google')
+    bytes_freed = data.get('bytes_freed')
+    note = data.get('note', '')
+    deleted_at = datetime.utcnow().isoformat() if status in ('deleted', 'verified') else None
+
+    ddb = get_deletion_db()
+    ddb.execute("""
+        INSERT INTO deletion_log
+            (year, month, status, count_local, count_google, bytes_freed, deleted_at, note, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(year, month) DO UPDATE SET
+            status=excluded.status,
+            count_local=COALESCE(excluded.count_local, deletion_log.count_local),
+            count_google=COALESCE(excluded.count_google, deletion_log.count_google),
+            bytes_freed=COALESCE(excluded.bytes_freed, deletion_log.bytes_freed),
+            deleted_at=COALESCE(excluded.deleted_at, deletion_log.deleted_at),
+            note=excluded.note,
+            updated_at=CURRENT_TIMESTAMP
+    """, (int(year), int(month), status, count_local, count_google, bytes_freed, deleted_at, note))
+    ddb.commit()
+    row = ddb.execute(
+        "SELECT * FROM deletion_log WHERE year = ? AND month = ?",
+        (int(year), int(month))
+    ).fetchone()
+    log_action('deletion_status_set',
+               f'photos:{int(year)}:{int(month):02d}',
+               {'status': status, 'count_local': count_local,
+                'count_google': count_google, 'bytes_freed': bytes_freed,
+                'note': note})
+    return jsonify(dict(row))
 
 
 @app.route('/api/files/extract', methods=['POST'])

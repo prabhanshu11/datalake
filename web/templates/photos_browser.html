@@ -25,6 +25,41 @@
     .chip.active { background: #1f6feb; border-color: #1f6feb; color: white; }
     .chip.disabled { opacity: 0.3; pointer-events: none; }
     .chip .count { opacity: 0.7; font-size: 0.7rem; margin-left: 0.2rem; }
+
+    /* Deletion-status overlays for month chips */
+    .chip.del-reviewed { border-color: #f0883e; box-shadow: inset 3px 0 0 #f0883e; }
+    .chip.del-deleted  { border-color: #3fb950; box-shadow: inset 3px 0 0 #3fb950; }
+    .chip.del-verified { background: #238636; border-color: #238636; color: #fff; }
+    .chip.del-deleted .count, .chip.del-verified .count { color: #c9d1d9; }
+
+    /* Mark-this-month panel */
+    .mark-panel {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 0.85rem 1rem;
+        margin: 0.75rem 0 1rem;
+        display: grid;
+        grid-template-columns: auto 1fr 1fr 1fr auto;
+        gap: 0.5rem 0.75rem;
+        align-items: center;
+        font-size: 0.85rem;
+    }
+    .mark-panel label { color: #8b949e; font-size: 0.75rem; }
+    .mark-panel select, .mark-panel input, .mark-panel textarea {
+        background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+        border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.8rem; width: 100%;
+    }
+    .mark-panel .full { grid-column: 1 / -1; }
+    .mark-panel button {
+        padding: 0.4rem 0.9rem; background: #238636; border: 1px solid #2ea043;
+        color: white; border-radius: 4px; cursor: pointer; font-size: 0.8rem;
+    }
+    .mark-panel button:hover { background: #2ea043; }
+    .mark-panel .saved-tag {
+        font-size: 0.75rem; color: #3fb950;
+    }
+    .mark-panel .saved-tag.warn { color: #f0883e; }
     .view-tab { padding: 0.4rem 1rem; font-size: 0.85rem; }
     .view-tab.active { background: #238636; border-color: #238636; }
 
@@ -125,8 +160,9 @@
     {% set month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] %}
     {% for m in range(1, 13) %}
     {% set mcount = month_counts.get(m, 0) %}
+    {% set dstatus = deletion_status_map.get(m) %}
     <a href="/files/photos?year={{ current_year }}&month={{ m }}&view={{ current_view }}"
-       class="chip {% if current_month == m %}active{% endif %} {% if mcount == 0 %}disabled{% endif %}">
+       class="chip {% if current_month == m %}active{% endif %} {% if mcount == 0 and not dstatus %}disabled{% endif %} {% if dstatus %}del-{{ dstatus }}{% endif %}">
         {{ month_names[m-1] }} <span class="count">({{ mcount }})</span>
     </a>
     {% endfor %}
@@ -154,75 +190,630 @@
     &middot; Page {{ page }} of {{ ((total - 1) // per_page) + 1 if total > 0 else 1 }}
 </div>
 
-{% if current_view == 'photos' %}
-<!-- Photos view: JPG + RAW + JSON paired -->
-{% if paired %}
-<table class="photo-grid">
-    <thead>
-        <tr>
-            <th>JPG / Image</th>
-            <th>RAW</th>
-            <th>JSON Metadata</th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for row in paired %}
-        <tr>
-            <!-- JPG column -->
-            <td class="file-cell">
-                {% if row.jpg %}
-                <div class="fname">{{ row.jpg.filename }}</div>
-                <div class="fsize">{{ format_size(row.jpg.size_bytes) }}</div>
-                <div class="farchive">{{ row.jpg.source_archive|replace('takeout-20260126T191854Z-', '') }}</div>
-                {% if row.jpg.extracted %}
-                    <span class="extracted-badge">&#10003; extracted</span>
-                {% else %}
-                    <button class="extract-btn" onclick="extractFile(this, '{{ row.jpg.path }}', '{{ row.jpg.source_archive }}')">Extract</button>
-                {% endif %}
-                {% else %}
-                <span class="empty-cell">(no image)</span>
-                {% endif %}
-            </td>
-            <!-- RAW column -->
-            <td class="file-cell">
-                {% if row.raw %}
-                <div class="fname">{{ row.raw.filename }}</div>
-                <div class="fsize">{{ format_size(row.raw.size_bytes) }}</div>
-                <div class="farchive">{{ row.raw.source_archive|replace('takeout-20260126T191854Z-', '') }}</div>
-                {% if row.raw.extracted %}
-                    <span class="extracted-badge">&#10003; extracted</span>
-                {% else %}
-                    <button class="extract-btn" onclick="extractFile(this, '{{ row.raw.path }}', '{{ row.raw.source_archive }}')">Extract</button>
-                {% endif %}
-                {% else %}
-                <span class="empty-cell">(no RAW)</span>
-                {% endif %}
-            </td>
-            <!-- JSON column -->
-            <td class="json-cell">
-                {% if row.json %}
-                {% for j in row.json %}
-                <div class="json-info">
-                    <div class="jname">{{ j.filename }}</div>
-                    <div>{{ format_size(j.size_bytes) }}</div>
-                    {% if j.extracted %}
-                        <span class="extracted-badge">&#10003;</span>
-                    {% else %}
-                        <button class="extract-btn" onclick="extractFile(this, '{{ j.path }}', '{{ j.source_archive }}')">Extract</button>
-                    {% endif %}
-                </div>
-                {% endfor %}
-                {% else %}
-                <span class="empty-cell">-</span>
-                {% endif %}
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
-{% else %}
-<p style="color: #8b949e; padding: 2rem; text-align: center;">No photos found for this selection.</p>
+{% if current_month %}
+<div style="font-weight:600; color:#8b949e; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.5px; margin: 0.25rem 0 0.3rem;">
+    {{ month_names[current_month-1] }} {{ current_year }} — month-level status
+    <span style="text-transform:none; font-weight:400; color:#484f58;">(applies to the whole month, not individual photos)</span>
+</div>
+<form id="markPanel" class="mark-panel" onsubmit="return saveDeletion(event)">
+    <input type="hidden" name="year" value="{{ current_year }}">
+    <input type="hidden" name="month" value="{{ current_month }}">
+    <input type="hidden" name="count_local" value="{{ total }}">
+
+    <div>
+        <label>Status</label>
+        <select name="status">
+            {% set cur_status = (current_deletion.status if current_deletion else 'pending') %}
+            <option value="pending"  {% if cur_status=='pending'  %}selected{% endif %}>pending</option>
+            <option value="reviewed" {% if cur_status=='reviewed' %}selected{% endif %}>reviewed</option>
+            <option value="deleted"  {% if cur_status=='deleted'  %}selected{% endif %}>deleted</option>
+            <option value="verified" {% if cur_status=='verified' %}selected{% endif %}>verified</option>
+        </select>
+    </div>
+    <div>
+        <label>Google count</label>
+        <input type="number" name="count_google" min="0"
+               value="{{ current_deletion.count_google if current_deletion and current_deletion.count_google is not none else '' }}"
+               placeholder="from photos.google.com">
+    </div>
+    <div>
+        <label>GB freed</label>
+        <input type="number" name="bytes_freed_gb" step="0.01" min="0"
+               value="{{ '%.2f'|format(current_deletion.bytes_freed / 1073741824) if current_deletion and current_deletion.bytes_freed else '' }}"
+               placeholder="from Storage">
+    </div>
+    <div>
+        <label>&nbsp;</label>
+        <button type="submit">Save</button>
+    </div>
+    <div class="full">
+        <label>Note</label>
+        <textarea name="note" rows="1" placeholder="anything surprising">{{ current_deletion.note if current_deletion else '' }}</textarea>
+    </div>
+    <div class="full" id="markStatus">
+        {% if current_deletion %}
+        <span class="saved-tag">Saved {{ current_deletion.updated_at }} &middot; status: {{ current_deletion.status }}{% if current_deletion.deleted_at %} &middot; deleted {{ current_deletion.deleted_at }}{% endif %}</span>
+        {% else %}
+        <span class="saved-tag warn">No log entry yet for {{ month_names[current_month-1] }} {{ current_year }}</span>
+        {% endif %}
+    </div>
+</form>
 {% endif %}
+
+{% if current_view == 'photos' %}
+<!-- Photos view: infinite-scroll thumbnail grid with marquee selection -->
+<style>
+    .pgrid-wrap { position: relative; user-select: none; }
+    .pgrid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 6px;
+        margin-bottom: 1rem;
+    }
+    .ptile {
+        position: relative;
+        aspect-ratio: 1 / 1;
+        background: #161b22;
+        border: 2px solid #30363d;
+        border-radius: 4px;
+        overflow: hidden;
+        cursor: pointer;
+    }
+    .ptile img { width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-drag: none; pointer-events: none; }
+    .ptile { -webkit-user-drag: none; user-select: none; }
+    .ptile * { pointer-events: none; }
+    .ptile.focused { outline: 2px solid #f0883e; outline-offset: -2px; }
+    .ptile .ph-placeholder {
+        width: 100%; height: 100%;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 0.65rem; color: #484f58; padding: 0.5rem;
+        text-align: center; word-break: break-all;
+    }
+    .ptile .pcap {
+        position: absolute; bottom: 0; left: 0; right: 0;
+        background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+        color: #fff; font-size: 0.65rem; padding: 0.4rem 0.4rem 0.3rem;
+        line-height: 1.2; pointer-events: none;
+    }
+    .ptile .pcap .pdate { opacity: 0.85; }
+    .ptile .pcap .parch { opacity: 0.6; font-size: 0.6rem; }
+    .ptile .ptype-badge {
+        position: absolute; top: 4px; right: 4px;
+        padding: 1px 5px; border-radius: 3px;
+        font-size: 0.6rem; background: rgba(0,0,0,0.7); color: #fff;
+    }
+    /* Edit-stack visual: layered card hint behind the tile */
+    .ptile.has-edits::before {
+        content: '';
+        position: absolute;
+        inset: 4px -4px -4px 4px;
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        z-index: -1;
+    }
+    .ptile.has-edits {
+        margin-right: 4px; margin-bottom: 4px;
+    }
+    .ptile .pedit-badge {
+        position: absolute; top: 4px; left: 4px;
+        padding: 1px 5px; border-radius: 3px;
+        font-size: 0.6rem; background: rgba(31,111,235,0.85); color: #fff;
+    }
+    /* Per-photo review status overlay (bottom-right) */
+    .ptile .pstatus {
+        position: absolute; bottom: 4px; right: 4px;
+        width: 14px; height: 14px; border-radius: 50%;
+        border: 2px solid #0d1117;
+        z-index: 2;
+    }
+    .ptile.rs-reviewed .pstatus { background: #3fb950; }
+    .ptile.rs-flagged  .pstatus { background: #f0883e; }
+    .ptile.rs-keep     .pstatus { background: #1f6feb; }
+    .ptile:not(.rs-reviewed):not(.rs-flagged):not(.rs-keep) .pstatus { display: none; }
+    /* Selected state */
+    .ptile.selected { border-color: #1f6feb; box-shadow: 0 0 0 2px #1f6feb; }
+    /* Marquee rectangle */
+    #marquee {
+        position: absolute; pointer-events: none;
+        background: rgba(31, 111, 235, 0.15);
+        border: 1px solid #1f6feb;
+        z-index: 5;
+        display: none;
+    }
+    /* Bulk action toolbar (sticky) */
+    #bulkBar {
+        position: sticky; top: 0; z-index: 50;
+        background: #161b22; border: 1px solid #1f6feb;
+        border-radius: 6px;
+        padding: 0.55rem 0.85rem;
+        margin-bottom: 0.5rem;
+        display: none;
+        flex-wrap: wrap; gap: 0.5rem; align-items: center;
+        font-size: 0.85rem;
+    }
+    #bulkBar .count { color: #58a6ff; font-weight: 600; }
+    #bulkBar select, #bulkBar input {
+        background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+        border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.8rem;
+    }
+    #bulkBar input { flex: 1; min-width: 200px; }
+    #bulkBar button {
+        background: #238636; border: 1px solid #2ea043; color: white;
+        padding: 0.35rem 0.85rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem;
+    }
+    #bulkBar button.clear {
+        background: transparent; border-color: #30363d; color: #8b949e;
+    }
+    #pgridStatus { color: #8b949e; font-size: 0.85rem; padding: 1rem 0; text-align: center; }
+    #pgridSentinel { height: 40px; }
+    /* Modal */
+    #pmodal {
+        display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92);
+        z-index: 1000; align-items: center; justify-content: center;
+        flex-direction: column; cursor: pointer;
+    }
+    #pmodal.open { display: flex; }
+    #pmodalBody { max-width: 92vw; max-height: 82vh; position: relative; }
+    #pmodalBody img { max-width: 92vw; max-height: 82vh; display: block; }
+    #pmodalLoader {
+        position: absolute; top: 8px; right: 8px;
+        background: rgba(0,0,0,0.7); color: #f0883e;
+        padding: 0.3rem 0.7rem; border-radius: 4px; font-size: 0.75rem;
+    }
+    #pmodalCaption { color: #c9d1d9; font-size: 0.85rem; margin-top: 0.6rem; text-align: center; max-width: 92vw; }
+    .keymap { color: #484f58; font-size: 0.7rem; margin-bottom: 0.4rem; }
+</style>
+
+<div id="bulkBar">
+    <span><span class="count" id="bulkCount">0</span> selected</span>
+    <select id="bulkStatus">
+        <option value="reviewed">reviewed</option>
+        <option value="flagged">flagged</option>
+        <option value="keep">keep (don't delete)</option>
+        <option value="pending">pending (clear)</option>
+    </select>
+    <input id="bulkNote" placeholder="optional note" />
+    <button id="bulkApply">Apply</button>
+    <button class="clear" id="bulkClear">Clear selection</button>
+</div>
+
+<div style="display:flex; align-items:center; gap:0.6rem; margin: 0.25rem 0 0.5rem; flex-wrap:wrap;">
+    <button id="sortBtn" class="chip view-tab"
+        style="cursor:pointer; padding:0.35rem 0.7rem; font-size:0.8rem;"
+        title="Toggle sort order">
+        Sort: <span id="sortDirLabel">oldest → newest</span>
+    </button>
+    <div class="keymap" style="margin:0;">
+        Tip: click-and-drag to marquee-select (anywhere) · Ctrl+A select all loaded · Shift-click to toggle · Arrow keys navigate · Enter opens · Esc clears
+    </div>
+</div>
+
+<div class="pgrid-wrap" id="pgridWrap">
+    <div id="pgrid" class="pgrid"
+         data-year="{{ current_year }}"
+         data-month="{{ current_month or '' }}"></div>
+    <div id="marquee"></div>
+</div>
+<div id="pgridSentinel"></div>
+<div id="pgridStatus">Loading…</div>
+
+<!-- Modal for full image -->
+<div id="pmodal">
+    <div id="pmodalBody"></div>
+    <div id="pmodalCaption"></div>
+</div>
+
+<script>
+(function() {
+    const grid = document.getElementById('pgrid');
+    const wrap = document.getElementById('pgridWrap');
+    const marquee = document.getElementById('marquee');
+    const sentinel = document.getElementById('pgridSentinel');
+    const statusDiv = document.getElementById('pgridStatus');
+    const bulkBar = document.getElementById('bulkBar');
+    const bulkCount = document.getElementById('bulkCount');
+    const year = grid.dataset.year;
+    const month = grid.dataset.month;
+    const LIMIT = 200;
+    let offset = 0;
+    let loading = false;
+    let done = false;
+    let sortOrder = (new URLSearchParams(location.search).get('order') || 'asc');
+    const selected = new Set();      // primary file_ids of selected tiles (one per tile)
+    let suppressNextClick = false;   // after a marquee drag
+
+    function tileLinkedIds(t) {
+        return (t.dataset.linked || t.dataset.fid).split(',').map(s => parseInt(s, 10));
+    }
+    function totalSelectedFiles() {
+        let n = 0;
+        for (const fid of selected) {
+            const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
+            n += t ? tileLinkedIds(t).length : 1;
+        }
+        return n;
+    }
+
+    function fmtBytes(n) {
+        if (!n) return '';
+        if (n > 1e9) return (n/1e9).toFixed(2)+' GB';
+        if (n > 1e6) return (n/1e6).toFixed(1)+' MB';
+        if (n > 1e3) return (n/1e3).toFixed(0)+' KB';
+        return n+' B';
+    }
+
+    function tile(it) {
+        const ext = (it.ext || '').replace('.','').toUpperCase();
+        const dateStr = it.taken_at ? it.taken_at.slice(0,16).replace('T',' ') : '—';
+        const visual = it.has_thumb
+            ? `<img loading="lazy" src="/static/thumbs/${it.file_id}.jpg" alt="">`
+            : `<div class="ph-placeholder">${it.filename}</div>`;
+        const isRaw = /\.(dng|raf|cr2|arw|nef|orf|rw2|heic|heif)$/i.test(it.filename);
+        const typeBadge = isRaw ? `<span class="ptype-badge">${ext}</span>` : '';
+        const editIds = it.edit_file_ids || [];
+        const editClass = editIds.length ? ' has-edits' : '';
+        const editBadge = editIds.length
+            ? `<span class="pedit-badge" title="includes ${editIds.length} edit">+${editIds.length} edit</span>`
+            : '';
+        // linked: comma-separated file_ids that travel together (primary first)
+        const linked = [it.file_id, ...editIds].join(',');
+        return `<div class="ptile${editClass}" data-fid="${it.file_id}" data-linked="${linked}" data-fname="${it.filename}" data-arch="${it.source_archive}">
+            ${visual}${typeBadge}${editBadge}
+            <div class="pcap">
+                <div class="pdate">${dateStr}</div>
+                <div class="parch">${it.source_archive} · ${fmtBytes(it.size_bytes)}</div>
+            </div>
+            <div class="pstatus" title=""></div>
+        </div>`;
+    }
+
+    async function fetchReviewStatuses(ids) {
+        if (!ids.length) return;
+        try {
+            const resp = await fetch('/api/photos/review?ids=' + ids.join(','));
+            const data = await resp.json();
+            for (const [fid, info] of Object.entries(data || {})) {
+                applyStatus(fid, info.status, info.note, info.reviewed_at);
+            }
+        } catch (e) { /* swallow */ }
+    }
+
+    function applyStatus(fid, status, note, reviewedAt) {
+        const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
+        if (!t) return;
+        t.classList.remove('rs-reviewed','rs-flagged','rs-keep');
+        if (status && status !== 'pending') {
+            t.classList.add('rs-' + status);
+        }
+        const dot = t.querySelector('.pstatus');
+        if (dot) {
+            const parts = [status];
+            if (note) parts.push(note);
+            if (reviewedAt) parts.push(reviewedAt);
+            dot.title = parts.join(' — ');
+        }
+    }
+
+    async function loadMore() {
+        if (loading || done) return;
+        loading = true;
+        statusDiv.textContent = 'Loading…';
+        const url = `/api/photos/list?year=${encodeURIComponent(year)}&offset=${offset}&limit=${LIMIT}&order=${sortOrder}` +
+                    (month ? `&month=${month}` : '');
+        try {
+            const resp = await fetch(url);
+            const data = await resp.json();
+            const items = data.items || [];
+            if (items.length === 0) {
+                done = true;
+                statusDiv.textContent = offset === 0 ? 'No photos in this selection.' : `End of list — ${offset} loaded.`;
+                return;
+            }
+            grid.insertAdjacentHTML('beforeend', items.map(tile).join(''));
+            offset += items.length;
+            statusDiv.textContent = `${offset} loaded — scroll for more`;
+            // Fetch review statuses for newly inserted tiles
+            fetchReviewStatuses(items.map(it => it.file_id));
+            if (items.length < LIMIT) {
+                done = true;
+                statusDiv.textContent = `End of list — ${offset} loaded.`;
+            }
+        } catch (e) {
+            statusDiv.textContent = 'Error: ' + e.message;
+        } finally {
+            loading = false;
+        }
+    }
+
+    const io = new IntersectionObserver(entries => {
+        if (entries[0].isIntersecting) loadMore();
+    }, {rootMargin: '600px'});
+    io.observe(sentinel);
+
+    function updateSortLabel() {
+        document.getElementById('sortDirLabel').textContent =
+            sortOrder === 'asc' ? 'oldest → newest' : 'newest → oldest';
+    }
+    function reloadGrid() {
+        offset = 0; done = false;
+        clearSelection();
+        grid.innerHTML = '';
+        statusDiv.textContent = 'Loading…';
+        loadMore();
+    }
+    document.getElementById('sortBtn').addEventListener('click', () => {
+        sortOrder = (sortOrder === 'asc') ? 'desc' : 'asc';
+        updateSortLabel();
+        reloadGrid();
+    });
+    updateSortLabel();
+    loadMore();
+
+    // ---- Selection management ----
+    function setSelected(fid, on) {
+        const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
+        if (!t) return;
+        if (on) { selected.add(fid); t.classList.add('selected'); }
+        else    { selected.delete(fid); t.classList.remove('selected'); }
+    }
+    function clearSelection() {
+        for (const fid of Array.from(selected)) setSelected(fid, false);
+        renderBulk();
+    }
+    function renderBulk() {
+        if (selected.size === 0) {
+            bulkBar.style.display = 'none';
+        } else {
+            bulkBar.style.display = 'flex';
+            const tiles = selected.size;
+            const files = totalSelectedFiles();
+            bulkCount.textContent = (tiles === files)
+                ? `${tiles}`
+                : `${tiles} tiles · ${files} files`;
+        }
+    }
+
+    // ---- Marquee selection (Picasa-style: drag anywhere starts selection) ----
+    let dragOrigin = null;     // {x, y} relative to wrap
+    let dragStartedOn = null;  // fid of tile under mousedown, or null
+    let isDragging = false;    // exceeded threshold
+    let baseSelection = null;  // snapshot when shift-drag began
+    const DRAG_THRESHOLD = 5;
+
+    wrap.addEventListener('mousedown', ev => {
+        if (ev.button !== 0) return;
+        const r = wrap.getBoundingClientRect();
+        dragOrigin = {x: ev.clientX - r.left, y: ev.clientY - r.top, sx: ev.clientX, sy: ev.clientY};
+        const tile = ev.target.closest('.ptile');
+        dragStartedOn = tile ? tile.dataset.fid : null;
+        isDragging = false;
+        baseSelection = ev.shiftKey ? new Set(selected) : null;  // null = replace
+        marquee.style.display = 'none';
+        ev.preventDefault();  // prevent native image drag
+    });
+
+    function updateMarquee(ev) {
+        if (!dragOrigin) return;
+        const dx = Math.abs(ev.clientX - dragOrigin.sx);
+        const dy = Math.abs(ev.clientY - dragOrigin.sy);
+        if (!isDragging && (dx + dy) < DRAG_THRESHOLD) return;
+        isDragging = true;
+
+        const r = wrap.getBoundingClientRect();
+        const x = ev.clientX - r.left, y = ev.clientY - r.top;
+        const left = Math.min(x, dragOrigin.x), top = Math.min(y, dragOrigin.y);
+        const w = Math.abs(x - dragOrigin.x), h = Math.abs(y - dragOrigin.y);
+        marquee.style.left = left + 'px';
+        marquee.style.top  = top + 'px';
+        marquee.style.width  = w + 'px';
+        marquee.style.height = h + 'px';
+        marquee.style.display = 'block';
+
+        // Compute intersections (use viewport-coords)
+        const wrapRect = wrap.getBoundingClientRect();
+        const mrect = {
+            left: wrapRect.left + left, top: wrapRect.top + top,
+            right: wrapRect.left + left + w, bottom: wrapRect.top + top + h
+        };
+        const tiles = grid.querySelectorAll('.ptile');
+        // Reset to baseline first (replace mode = empty, additive = baseSelection)
+        const desired = new Set(baseSelection || []);
+        tiles.forEach(t => {
+            const tr = t.getBoundingClientRect();
+            const intersects = !(tr.right < mrect.left || tr.left > mrect.right
+                || tr.bottom < mrect.top || tr.top > mrect.bottom);
+            if (intersects) desired.add(t.dataset.fid);
+        });
+        // Diff: add new, remove old
+        for (const fid of selected) if (!desired.has(fid)) setSelected(fid, false);
+        for (const fid of desired) if (!selected.has(fid)) setSelected(fid, true);
+        renderBulk();
+    }
+    document.addEventListener('mousemove', updateMarquee);
+
+    document.addEventListener('mouseup', ev => {
+        if (!dragOrigin) return;
+        const wasDragging = isDragging;
+        const startedOn = dragStartedOn;
+        dragOrigin = null;
+        dragStartedOn = null;
+        isDragging = false;
+        marquee.style.display = 'none';
+        if (wasDragging) {
+            suppressNextClick = true;  // suppress the click that follows mouseup
+            return;
+        }
+        // Plain click (no drag) on a tile
+        if (startedOn) {
+            const tile = grid.querySelector(`.ptile[data-fid="${startedOn}"]`);
+            if (!tile) return;
+            if (ev.shiftKey) {
+                setSelected(startedOn, !selected.has(startedOn));
+                renderBulk();
+                setFocus(tile);
+                return;
+            }
+            // No shift = open modal (selection is unchanged)
+            setFocus(tile);
+            openModal(tile);
+        }
+    });
+
+    // Click on tiles still fires after mouseup; suppress if drag
+    grid.addEventListener('click', ev => {
+        if (suppressNextClick) { suppressNextClick = false; ev.stopPropagation(); ev.preventDefault(); }
+    }, true);
+
+    // ---- Keyboard navigation ----
+    let focused = null;  // currently focused tile element
+    function setFocus(t) {
+        if (focused) focused.classList.remove('focused');
+        focused = t;
+        if (t) {
+            t.classList.add('focused');
+            t.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+        }
+    }
+    function tilesArr() { return Array.from(grid.querySelectorAll('.ptile')); }
+    function colsPerRow() {
+        const tiles = tilesArr();
+        if (tiles.length < 2) return 1;
+        const top0 = tiles[0].getBoundingClientRect().top;
+        let cols = 0;
+        for (const t of tiles) {
+            if (Math.abs(t.getBoundingClientRect().top - top0) < 4) cols++;
+            else break;
+        }
+        return Math.max(1, cols);
+    }
+    function moveFocus(delta) {
+        const tiles = tilesArr();
+        if (!tiles.length) return;
+        let idx = focused ? tiles.indexOf(focused) : -1;
+        idx = Math.max(0, Math.min(tiles.length - 1, idx + delta));
+        setFocus(tiles[idx]);
+    }
+    document.addEventListener('keydown', ev => {
+        const modal = document.getElementById('pmodal');
+        // Don't intercept when typing in a form field
+        const tag = (ev.target.tagName || '').toLowerCase();
+        const inField = (tag === 'input' || tag === 'textarea' || tag === 'select');
+
+        // Ctrl/Cmd + A = select all loaded
+        if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a' && !inField) {
+            ev.preventDefault();
+            for (const t of tilesArr()) setSelected(t.dataset.fid, true);
+            renderBulk();
+            return;
+        }
+        if (ev.key === 'Escape') {
+            if (modal.classList.contains('open')) {
+                modal.classList.remove('open');
+            } else {
+                clearSelection();
+            }
+            return;
+        }
+        if (inField) return;
+
+        if (modal.classList.contains('open')) {
+            // Modal open: arrow keys cycle photos
+            if (ev.key === 'ArrowRight' || ev.key === 'ArrowLeft') {
+                ev.preventDefault();
+                moveFocus(ev.key === 'ArrowRight' ? 1 : -1);
+                if (focused) openModal(focused);
+            }
+            return;
+        }
+        // Grid: arrow keys move focus
+        const cols = colsPerRow();
+        const map = {ArrowRight: 1, ArrowLeft: -1, ArrowDown: cols, ArrowUp: -cols};
+        if (ev.key in map) {
+            ev.preventDefault();
+            moveFocus(map[ev.key]);
+            return;
+        }
+        if (ev.key === 'Enter' && focused) {
+            ev.preventDefault();
+            openModal(focused);
+            return;
+        }
+        if (ev.key === ' ' && focused) {
+            // Spacebar toggles selection of focused tile
+            ev.preventDefault();
+            const fid = focused.dataset.fid;
+            setSelected(fid, !selected.has(fid));
+            renderBulk();
+        }
+    });
+
+    // Bulk apply
+    document.getElementById('bulkApply').addEventListener('click', async () => {
+        if (!selected.size) return;
+        const status = document.getElementById('bulkStatus').value;
+        const noteInput = document.getElementById('bulkNote');
+        const note = noteInput.value || null;
+        // Expand each selected tile to ALL its linked file_ids (primary + edits)
+        const allIds = new Set();
+        const visibleIds = [];  // primary ids — used to update tile UI
+        for (const fid of selected) {
+            const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
+            visibleIds.push(fid);
+            for (const lid of tileLinkedIds(t)) allIds.add(lid);
+        }
+        const idsArr = Array.from(allIds);
+        const resp = await fetch('/api/photos/review', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({file_ids: idsArr, status, note})
+        });
+        const data = await resp.json();
+        if (data.error) { alert('Error: ' + data.error); return; }
+        // Update tile visuals using primary ids
+        const now = new Date().toISOString().replace('T',' ').slice(0,19);
+        visibleIds.forEach(fid => applyStatus(String(fid), status, note, now));
+        noteInput.value = '';
+        clearSelection();
+    });
+    document.getElementById('bulkClear').addEventListener('click', clearSelection);
+
+    // ---- Modal: thumb first, full on demand ----
+    const modal = document.getElementById('pmodal');
+    const modalBody = document.getElementById('pmodalBody');
+    const modalCap = document.getElementById('pmodalCaption');
+    function openModal(t) {
+        const fid = t.dataset.fid;
+        const fname = t.dataset.fname;
+        const arch = t.dataset.arch;
+        modalBody.innerHTML = `
+            <img id="modalThumb" src="/static/thumbs/${fid}.jpg" style="filter: blur(0px);">
+            <div id="pmodalLoader">loading full size…</div>`;
+        modalCap.textContent = `${fname} · ${arch} · click to close · Esc to close`;
+        modal.classList.add('open');
+        // Try to load full image in background, swap when ready
+        const fullImg = new Image();
+        fullImg.onload = () => {
+            const thumb = document.getElementById('modalThumb');
+            const loader = document.getElementById('pmodalLoader');
+            if (thumb) thumb.src = fullImg.src;
+            if (loader) loader.remove();
+        };
+        fullImg.onerror = () => {
+            const loader = document.getElementById('pmodalLoader');
+            if (loader) {
+                loader.style.color = '#8b949e';
+                loader.textContent = 'full image not available on this host';
+            }
+        };
+        fullImg.src = `/api/photos/full/${fid}`;
+    }
+    modal.addEventListener('click', ev => {
+        // Don't close when clicking image itself? — Picasa-style click-anywhere closes.
+        modal.classList.remove('open');
+    });
+})();
+</script>
 
 {% elif current_view == 'videos' %}
 <!-- Videos view: Video + JSON paired -->
@@ -335,6 +926,45 @@
 {% endif %}
 
 <script>
+function saveDeletion(ev) {
+    ev.preventDefault();
+    const f = document.getElementById('markPanel');
+    const fd = new FormData(f);
+    const gb = parseFloat(fd.get('bytes_freed_gb'));
+    const payload = {
+        year: parseInt(fd.get('year')),
+        month: parseInt(fd.get('month')),
+        status: fd.get('status'),
+        count_local: parseInt(fd.get('count_local')) || null,
+        count_google: fd.get('count_google') ? parseInt(fd.get('count_google')) : null,
+        bytes_freed: !isNaN(gb) ? Math.round(gb * 1073741824) : null,
+        note: fd.get('note') || ''
+    };
+    const status = document.getElementById('markStatus');
+    status.innerHTML = '<span class="saved-tag warn">Saving...</span>';
+    fetch('/api/deletion/status', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) {
+            status.innerHTML = '<span class="saved-tag warn">Error: ' + data.error + '</span>';
+        } else {
+            status.innerHTML = '<span class="saved-tag">Saved &middot; status: ' + data.status +
+                (data.deleted_at ? ' &middot; deleted ' + data.deleted_at : '') + '</span>';
+            // Reload to refresh month-chip styling
+            setTimeout(() => location.reload(), 600);
+        }
+    })
+    .catch(err => {
+        status.innerHTML = '<span class="saved-tag warn">Network error</span>';
+        console.error(err);
+    });
+    return false;
+}
+
 function extractFile(btn, path, archive) {
     btn.classList.add('extracting');
     btn.textContent = 'Extracting...';

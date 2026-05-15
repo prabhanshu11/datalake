@@ -39,3 +39,6 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 progress_actual.md
+
+# Generated photo thumbnails (rebuild via deletion/scripts/build_thumbs.py)
+web/static/thumbs/

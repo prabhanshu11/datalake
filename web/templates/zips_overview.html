@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% block title %}Zip Archives - Datalake{% endblock %}
+
+{% block content %}
+<style>
+    .zip-table { font-size: 0.85rem; }
+    .zip-table th { font-size: 0.75rem; color: #8b949e; }
+    .zip-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .zip-table .small { font-size: 0.75rem; color: #8b949e; }
+    .yr-pill {
+        display: inline-block; padding: 0.1rem 0.4rem; margin: 0 0.2rem 0.2rem 0;
+        background: #21262d; border: 1px solid #30363d; border-radius: 3px;
+        font-size: 0.7rem; color: #8b949e; font-variant-numeric: tabular-nums;
+    }
+    .totals {
+        background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+        padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.85rem;
+    }
+    .totals span { margin-right: 1.5rem; color: #8b949e; }
+    .totals strong { color: #c9d1d9; }
+</style>
+
+<h1>Zip Archives <span style="font-size: 0.7em; color: #8b949e;">— backup chunks</span></h1>
+
+<div class="totals">
+    <span><strong>{{ total_archives }}</strong> archives</span>
+    <span><strong>{{ format_size(total_bytes) }}</strong> on disk</span>
+    <span><strong>{{ '{:,}'.format(total_files) }}</strong> files indexed</span>
+    <span><strong>{{ '{:,}'.format(total_photos) }}</strong> photo files</span>
+</div>
+
+<table class="zip-table">
+    <thead>
+        <tr>
+            <th>Archive</th>
+            <th class="num">Size</th>
+            <th class="num">Files</th>
+            <th class="num">Photos</th>
+            <th class="num">Videos</th>
+            <th class="num">Other</th>
+            <th>Date range (taken_at)</th>
+            <th>Top years</th>
+            <th>Services</th>
+            <th class="num">Extracted</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for a in archives %}
+        <tr>
+            <td>
+                <div>{{ a.short_name }}</div>
+                <div class="small">{{ a.indexed_at }}</div>
+            </td>
+            <td class="num">{{ format_size(a.size_bytes) }}</td>
+            <td class="num">{{ '{:,}'.format(a.file_count) }}</td>
+            <td class="num">{{ '{:,}'.format(a.photos) }}</td>
+            <td class="num">{{ '{:,}'.format(a.videos) }}</td>
+            <td class="num">{{ '{:,}'.format(a.other) }}</td>
+            <td>
+                {% if a.date_min %}
+                    <div class="small">{{ a.date_min }}</div>
+                    <div class="small">→ {{ a.date_max }}</div>
+                {% else %}
+                    <span class="small">—</span>
+                {% endif %}
+            </td>
+            <td>
+                {% for yr, cnt in a.top_years %}
+                <span class="yr-pill">{{ yr }}: {{ cnt }}</span>
+                {% endfor %}
+            </td>
+            <td>
+                {% for svc, cnt in a.services %}
+                <span class="yr-pill">{{ svc }}: {{ cnt }}</span>
+                {% endfor %}
+            </td>
+            <td class="num">
+                {% if a.extracted > 0 %}
+                <span style="color: #3fb950;">{{ '{:,}'.format(a.extracted) }}</span>
+                {% else %}
+                <span class="small">0</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
