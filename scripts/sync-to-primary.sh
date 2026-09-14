@@ -66,7 +66,13 @@ log "Local records: $LOCAL_STATS"
 # This creates an atomic, consistent copy even with concurrent writers.
 # Raw scp of a DB with active writers produces a corrupt copy
 # because the -journal file is not included.
-SNAPSHOT="/tmp/datalake_sync_snapshot.db"
+# On disk, NOT /tmp: /tmp is a 16 GB tmpfs with a user quota on both machines and the
+# DB is >20 GB. A partial 13 GB snapshot in /tmp blocked every other /tmp writer on the
+# desktop on 2026-09-11 (local-bootstrapping sync validation failed on it).
+SNAPSHOT_DIR="${HOME}/.cache/datalake"
+mkdir -p "$SNAPSHOT_DIR"
+SNAPSHOT="$SNAPSHOT_DIR/datalake_sync_snapshot.db"
+trap 'rm -f "$SNAPSHOT"' EXIT
 log "Creating consistent snapshot via VACUUM INTO..."
 rm -f "$SNAPSHOT"
 sq "$LOCAL_DB" "VACUUM INTO '$SNAPSHOT';"
@@ -81,14 +87,15 @@ log "Snapshot OK ($(du -h "$SNAPSHOT" | cut -f1))"
 
 # Transfer snapshot to remote
 log "Transferring snapshot to remote..."
-scp -q "$SNAPSHOT" "$REMOTE_HOST:/tmp/datalake_sync_source.db"
+ssh "$REMOTE_HOST" 'mkdir -p ~/.cache/datalake'
+scp -q "$SNAPSHOT" "$REMOTE_HOST:$HOME/.cache/datalake/datalake_sync_source.db"
 rm -f "$SNAPSHOT"
 
 log "Merging on remote using ATTACH..."
 ssh "$REMOTE_HOST" 'set -e
 sqlite3 ~/Programs/datalake/datalake.db "
 -- Attach source database
-ATTACH DATABASE '\''/tmp/datalake_sync_source.db'\'' AS source;
+ATTACH DATABASE '\''"$HOME"/.cache/datalake/datalake_sync_source.db'\'' AS source;
 
 -- Merge history (skip exact duplicates by session_id + timestamp_unix)
 INSERT OR IGNORE INTO claude_history
@@ -140,7 +147,7 @@ DETACH DATABASE source;
 "
 
 # Clean up
-rm -f /tmp/datalake_sync_source.db
+rm -f $HOME/.cache/datalake/datalake_sync_source.db
 '
 
 # Log sync event
