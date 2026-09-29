@@ -651,6 +651,19 @@ export DATA_DIR=/mnt/data-ssd/datalake
 ./scripts/init.sh
 ```
 
+## Pending Sources (registered, NOT ingested)
+
+| Source | Where it lives | Why not ingested yet |
+|--------|----------------|----------------------|
+| Keystroke log | `/var/log/keystroke-log/keystroke-YYYY-MM-DD.log` on each machine (root, 0600, kept forever) | Contains every typed password. The datalake DB is synced desktop↔laptop and the API listens on LAN/Tailscale, so ingesting would expose it. |
+
+**Gate for ingesting the keystroke log** — all of: a per-source access
+control (or a separate encrypted, local-only table never copied by
+`sync-to-primary.sh`), the API refusing that source over the network, and a
+redaction pass for lines typed into password prompts. Until then the logs stay
+on the machine that recorded them. Details:
+`local-bootstrapping/configs/keystroke-log/README.md` §"Datalake status".
+
 ## Future Enhancements
 
 - [x] **Docker Container**: Containerized deployment with isolated environment ✅
