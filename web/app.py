@@ -21,6 +21,24 @@ from search.es_client import DatalakeSearch
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB for ChatGPT zips
 
+# --- Request-timing instrumentation ----------------------------------------
+# Logs ANY request taking > 300 ms to /tmp/datalake-web.log with [SLOW] prefix.
+# Use to find the actual >5s offenders rather than guessing.
+@app.before_request
+def _t_start():
+    g._req_t0 = time.time()
+
+@app.after_request
+def _t_end(response):
+    t0 = getattr(g, '_req_t0', None)
+    if t0 is not None:
+        dt = (time.time() - t0) * 1000  # ms
+        if dt > 300:
+            print(f"[SLOW] {dt:7.1f}ms  {request.method} {request.full_path}  -> {response.status_code}",
+                  flush=True)
+    return response
+# ---------------------------------------------------------------------------
+
 # Audio directories to search for files
 AUDIO_DIRS = [
     Path.home() / 'Programs' / 'recordings',
@@ -1706,10 +1724,15 @@ def api_files_search():
 # =============================================================================
 
 # Media type classifications
-PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'}
 RAW_EXTENSIONS = {'.dng', '.raf', '.cr2', '.arw', '.nef', '.orf', '.rw2'}
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.3gp', '.m4v', '.mov', '.webm'}
 METADATA_EXTENSIONS = {'.json'}
+
+# Shared flag vocabulary (photo_review + deletion_log both use these four).
+# Months additionally carry deletion-lifecycle flags.
+SHARED_FLAGS = ('pending', 'reviewed', 'flagged', 'keep')
+MONTH_FLAGS  = SHARED_FLAGS + ('src_deleted', 'verified')
 
 
 def _parse_date_from_filename(filename):
@@ -2023,6 +2046,20 @@ def _photo_month_counts(db, year):
     return counts
 
 
+# --- File-metadata cache ---------------------------------------------------
+# Years list, per-year month counts, and view counts only change when the DB
+# is re-indexed (a manual operation). They are queried on every page load and
+# add up to ~200ms of full-table scans. Cache for the process lifetime; call
+# _invalidate_file_meta_cache() if file data is ever modified.
+import threading
+_file_meta_cache = {}
+_file_meta_lock = threading.Lock()
+
+def _invalidate_file_meta_cache():
+    with _file_meta_lock:
+        _file_meta_cache.clear()
+
+
 def _get_photo_years_local(db):
     """Get list of years with photo counts from local DB."""
     rows = db.execute("""
@@ -2057,7 +2094,14 @@ def photos_browser():
 
     db = get_files_db()
     if db:
-        years = _get_photo_years_local(db)
+        with _file_meta_lock:
+            cached_years = _file_meta_cache.get('years')
+        if cached_years is None:
+            years = _get_photo_years_local(db)
+            with _file_meta_lock:
+                _file_meta_cache['years'] = years
+        else:
+            years = cached_years
 
     # Default to latest year
     if not year and years:
@@ -2071,7 +2115,15 @@ def photos_browser():
         # NEW: unified count via _photo_month_counts (same source-of-truth as /api/photos/list).
         # Pair function still used to render the legacy table for old views, but for photos view
         # we don't need it — the grid fetches from /api/photos/list directly.
-        month_counts = _photo_month_counts(db, year)
+        _mc_key = ('month_counts', year)
+        with _file_meta_lock:
+            cached_mc = _file_meta_cache.get(_mc_key)
+        if cached_mc is None:
+            month_counts = _photo_month_counts(db, year)
+            with _file_meta_lock:
+                _file_meta_cache[_mc_key] = month_counts
+        else:
+            month_counts = cached_mc
         paired_page = []  # grid renders client-side via API
         if month:
             total_paired = month_counts.get(int(month), 0)
@@ -2106,6 +2158,9 @@ def photos_browser():
     # Deletion-tracking state for the year (and current month detail)
     deletion_status_map = {}
     current_deletion = None
+    # Set of year strings whose every photo-month is src_deleted/verified.
+    # Used by template to color year chips green.
+    years_done = set()
     try:
         ddb = get_deletion_db()
         if year:
@@ -2121,6 +2176,34 @@ def photos_browser():
             ).fetchone()
             if row:
                 current_deletion = dict(row)
+        # Build done-months map: year_int -> set of done month_ints.
+        done_months = {}
+        for r in ddb.execute(
+            "SELECT year, month FROM deletion_log WHERE status IN ('src_deleted','verified')"
+        ).fetchall():
+            done_months.setdefault(r['year'], set()).add(r['month'])
+        # A year is "done" if every month with photos in that year is done.
+        for y in years:
+            ystr = y.get('year', '')
+            if not (ystr and ystr.isdigit()):
+                continue
+            yint = int(ystr)
+            done_for_y = done_months.get(yint, set())
+            if not done_for_y:
+                continue
+            # Cached month_counts (avoids 20+ full table scans on every page load)
+            _mc_key = ('month_counts', ystr)
+            with _file_meta_lock:
+                cached_mc = _file_meta_cache.get(_mc_key)
+            if cached_mc is None:
+                mc = _photo_month_counts(db, ystr) if db else {}
+                with _file_meta_lock:
+                    _file_meta_cache[_mc_key] = mc
+            else:
+                mc = cached_mc
+            months_with_photos = set(mc.keys())
+            if months_with_photos and months_with_photos.issubset(done_for_y):
+                years_done.add(ystr)
     except Exception as e:
         app.logger.warning(f"deletion_log query failed: {e}")
 
@@ -2138,6 +2221,7 @@ def photos_browser():
                            data_source=data_source,
                            pi_reachable=pi_reachable,
                            deletion_status_map=deletion_status_map,
+                           years_done=years_done,
                            current_deletion=current_deletion)
 
 
@@ -2174,7 +2258,7 @@ def photos_review_set():
 
     if not file_ids:
         return jsonify({'error': 'file_ids required'}), 400
-    if status not in ('pending', 'reviewed', 'flagged', 'keep'):
+    if status not in MONTH_FLAGS:
         return jsonify({'error': 'invalid status'}), 400
     file_ids = [int(x) for x in file_ids]
 
@@ -2204,6 +2288,55 @@ def photos_review_set():
                f'photos:n={len(file_ids)}',
                {'file_ids': file_ids, 'status': status, 'note': note})
     return jsonify({'updated': len(file_ids), 'status': status})
+
+
+def _photo_ids_for_month(db, year, month) -> list:
+    """Return file IDs for all photo/video files in a given (year, month).
+
+    Reused by the rollup route and the month-flag cascade.
+    """
+    photo_exts = "','".join(PHOTO_EXTENSIONS | RAW_EXTENSIONS | VIDEO_EXTENSIONS)
+    rows = db.execute(f"""
+        SELECT f.id FROM files f LEFT JOIN photos p ON p.file_id = f.id
+        WHERE f.source_service = 'photos'
+          AND lower(f.extension) IN ('{photo_exts}')
+          AND f.path LIKE ?
+          AND (substr(p.taken_at, 6, 2) = ?
+               OR (p.taken_at IS NULL AND (f.filename GLOB ? OR f.filename GLOB ?)))
+    """, (f'%Photos from {year}%', f'{month:02d}',
+          f'*{year}{month:02d}*', f'*{year}-{month:02d}-*')).fetchall()
+    return [r[0] for r in rows]
+
+
+@app.route('/api/photos/review/rollup')
+def photos_review_rollup():
+    """Per-photo review counts for a (year, month) — per-status breakdown.
+
+    Returns {total, pending, reviewed, flagged, keep, src_deleted, verified, unflagged}
+    where unflagged = photos with no photo_review row at all.
+    """
+    year = request.args.get('year', '')
+    month = request.args.get('month', 0, type=int)
+    if not year or not month:
+        return jsonify({'error': 'year and month required'}), 400
+    db = get_files_db()
+    if not db:
+        return jsonify({'error': 'no files DB'}), 503
+
+    ids = _photo_ids_for_month(db, year, month)
+    roll = {'total': len(ids), 'pending': 0, 'reviewed': 0,
+            'flagged': 0, 'keep': 0, 'src_deleted': 0, 'verified': 0}
+    if ids:
+        ddb = get_deletion_db()
+        ph = ','.join('?' * len(ids))
+        for st, c in ddb.execute(
+            f"SELECT status, COUNT(*) FROM photo_review "
+            f"WHERE file_id IN ({ph}) GROUP BY status", ids).fetchall():
+            if st in roll:
+                roll[st] = c
+    with_row = sum(roll[s] for s in MONTH_FLAGS)
+    roll['unflagged'] = roll['total'] - with_row
+    return jsonify(roll)
 
 
 @app.route('/api/photos/full/<int:file_id>')
@@ -2257,7 +2390,7 @@ def photos_list_api():
     year = request.args.get('year', '')
     month = request.args.get('month', 0, type=int)
     offset = max(0, request.args.get('offset', 0, type=int))
-    limit = min(500, max(1, request.args.get('limit', 200, type=int)))
+    limit = min(100000, max(1, request.args.get('limit', 200, type=int)))
     order = request.args.get('order', 'asc').lower()
     if order not in ('asc', 'desc'):
         order = 'asc'
@@ -2313,6 +2446,7 @@ def photos_list_api():
     """
     params.extend([limit, offset])
     rows = db.execute(sql, params).fetchall()
+    has_more = len(rows) == limit
 
     thumbs_dir = Path(app.static_folder) / 'thumbs'
 
@@ -2359,7 +2493,268 @@ def photos_list_api():
             'has_thumb': thumb_path.exists(),
             'edit_file_ids': [],
         })
-    return jsonify({'items': items, 'offset': offset, 'limit': limit, 'returned': len(items)})
+    return jsonify({'items': items, 'offset': offset, 'limit': limit,
+                    'returned': len(items), 'has_more': has_more})
+
+
+# ----------------------------------------------------------------------------
+# Drive Browser  —  Phase 2 of Google account cleanup
+# Surfaces files under Takeout/Drive/Google Photos/ (45 GB unreviewed). These
+# are tagged `source_service='photos'` in local-index.db but live in Drive
+# zips (15-001/002), so the Photos UI's `Photos from YYYY` filter never sees
+# them. Same tile + bulk-bar UX; reuses /api/photos/review for per-file flags.
+# ----------------------------------------------------------------------------
+
+# All Drive content (was 'Takeout/Drive/Google Photos/' before — restricting
+# to GP missed Waynad Trip, Mathco dump, Books, python learning, etc., which
+# together account for ~25 GB of the remaining 77 GB).
+DRIVE_GP_PREFIX = 'Takeout/Drive/'
+
+# View → extension class for Drive browser
+_DRIVE_VIEW_EXTS = {
+    'photos': PHOTO_EXTENSIONS,                  # .jpg .png .heic …
+    'videos': VIDEO_EXTENSIONS,                  # .mp4 .mkv …
+    'raw':    RAW_EXTENSIONS,                    # .raf .dng …
+    # 'other' is everything not in the above three
+}
+
+
+def _drive_normalize_path(path: str) -> str:
+    """Normalize a sub-path under Takeout/Drive/Google Photos/.
+    - Strip leading/trailing slashes
+    - Reject any '..' segment for safety
+    - Empty string = root (Google Photos itself)
+    """
+    p = (path or '').strip('/').strip()
+    if not p:
+        return ''
+    parts = [s for s in p.split('/') if s]
+    if any(s == '..' for s in parts):
+        return ''
+    return '/'.join(parts)
+
+
+def _drive_subfolders(db, current_path: str):
+    """Immediate sub-folders of DRIVE_GP_PREFIX + current_path/, with recursive
+    file counts + sizes (counts include everything under each sub-folder)."""
+    base = DRIVE_GP_PREFIX + (current_path + '/' if current_path else '')
+    # base_len in 1-indexed SQL is len(base) + 1 for substr offset
+    rows = db.execute("""
+        SELECT
+          substr(path, ?+1, instr(substr(path, ?+1), '/')-1) AS subfolder,
+          COUNT(*) AS n,
+          SUM(size_bytes) AS bytes
+        FROM files
+        WHERE path LIKE ? || '%'
+          AND instr(substr(path, ?+1), '/') > 0
+        GROUP BY subfolder
+        ORDER BY SUM(size_bytes) DESC
+    """, (len(base), len(base), base, len(base))).fetchall()
+    out = []
+    for r in rows:
+        if not r['subfolder']:
+            continue
+        out.append({
+            'name': r['subfolder'],
+            'count': r['n'],
+            'size_gb': f"{(r['bytes'] or 0)/1073741824.0:.2f}",
+        })
+    return out
+
+
+def _drive_direct_count(db, current_path: str):
+    """Count of files DIRECTLY in current_path (not in any sub-folder)."""
+    base = DRIVE_GP_PREFIX + (current_path + '/' if current_path else '')
+    row = db.execute("""
+        SELECT COUNT(*) AS n, SUM(size_bytes) AS bytes
+        FROM files
+        WHERE path LIKE ? || '%'
+          AND instr(substr(path, ?+1), '/') = 0
+    """, (base, len(base))).fetchone()
+    return {
+        'count': row['n'] or 0,
+        'size_gb': f"{(row['bytes'] or 0)/1073741824.0:.2f}",
+    }
+
+
+def _drive_view_counts(db, current_path: str, recursive: bool):
+    """Per-view file counts for the selected path. recursive=True counts files
+    in all sub-folders too; False counts only direct files.
+    'all' = everything; 'other' = non-media (PDFs, docs, archives, .ini, …)."""
+    base = DRIVE_GP_PREFIX + (current_path + '/' if current_path else '')
+    if recursive:
+        rows = db.execute("""
+            SELECT lower(extension) AS ext
+            FROM files WHERE path LIKE ? || '%'
+        """, (base,)).fetchall()
+    else:
+        rows = db.execute("""
+            SELECT lower(extension) AS ext
+            FROM files
+            WHERE path LIKE ? || '%'
+              AND instr(substr(path, ?+1), '/') = 0
+        """, (base, len(base))).fetchall()
+    photos = videos = raw = other = 0
+    for r in rows:
+        ext = r['ext'] or ''
+        if ext in PHOTO_EXTENSIONS:   photos += 1
+        elif ext in VIDEO_EXTENSIONS: videos += 1
+        elif ext in RAW_EXTENSIONS:   raw    += 1
+        else:                          other  += 1
+    return {'all': len(rows), 'photos': photos, 'videos': videos,
+            'raw': raw, 'other': other}
+
+
+@app.after_request
+def _no_cache_drive_pages(resp):
+    """Prevent the browser from caching /files/drive HTML — without this, an
+    updated template can collide with a stale JS bundle still living in the
+    cached prior HTML, leaving thumbnails stuck at 'Loading…' on navigation."""
+    if request.path.startswith('/files/drive') or request.path.startswith('/api/drive/'):
+        resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route('/files/drive')
+def drive_browser():
+    """Drive review UI — folder-hierarchical browser for Takeout/Drive/Google Photos/.
+
+    Query params:
+        path: relative path under Google Photos/ (e.g. 'family/kerela trip'). Empty = top.
+        view: photos|videos|raw|other (ext filter on the tile grid)
+        recursive: '1' (default) = tile grid shows files in ALL sub-folders;
+                   '0' = only files directly in current path
+    """
+    # Back-compat: accept legacy ?folder=family
+    path = request.args.get('path', None)
+    if path is None:
+        path = request.args.get('folder', '') or ''
+        if path == '(root)':
+            path = ''  # legacy '(root)' meant "no sub-folder"
+    path = _drive_normalize_path(path)
+    # Default to 'all' to mirror how drive.google.com shows folders (mixed
+    # photos+videos+RAFs in one view). Per-type tabs remain available.
+    view = request.args.get('view', 'all')
+    if view not in ('all', 'photos', 'videos', 'raw', 'other'):
+        view = 'all'
+    recursive = request.args.get('recursive', '1') != '0'
+
+    db = get_files_db()
+    if not db:
+        return "No files DB available", 503
+
+    subfolders = _drive_subfolders(db, path)
+    direct = _drive_direct_count(db, path)
+    view_counts = _drive_view_counts(db, path, recursive)
+
+    # Breadcrumb segments — each step click-navigable
+    crumbs = [{'name': 'Drive', 'path': ''}]
+    if path:
+        accum = []
+        for seg in path.split('/'):
+            accum.append(seg)
+            crumbs.append({'name': seg, 'path': '/'.join(accum)})
+
+    # Headline counts for the page
+    total_row = db.execute("""
+        SELECT COUNT(*) AS n, SUM(size_bytes) AS bytes
+        FROM files WHERE path LIKE ?
+    """, (DRIVE_GP_PREFIX + '%',)).fetchone()
+    total_count = total_row['n'] or 0
+    total_size_gb = f"{(total_row['bytes'] or 0)/1073741824.0:.2f}"
+
+    return render_template('drive_browser.html',
+                           subfolders=subfolders,
+                           direct=direct,
+                           crumbs=crumbs,
+                           current_path=path,
+                           current_view=view,
+                           recursive=recursive,
+                           view_counts=view_counts,
+                           folder_label=DRIVE_GP_PREFIX + path,
+                           total=view_counts.get(view, 0),
+                           total_count=total_count,
+                           total_size_gb=total_size_gb)
+
+
+@app.route('/api/drive/list')
+def drive_list_api():
+    """Paginated JSON list of Drive files for the (path, view) selection.
+
+    Query params:
+        path (str, default ''),
+        view ('photos'|'videos'|'raw'|'other'),
+        recursive ('1'|'0', default '1'),
+        offset (int, default 0), limit (int, default 200, max 100000),
+        order ('asc'|'desc') — alphabetical by filename
+    """
+    path = _drive_normalize_path(request.args.get('path', ''))
+    view = request.args.get('view', 'all')
+    recursive = request.args.get('recursive', '1') != '0'
+    offset = max(0, request.args.get('offset', 0, type=int))
+    limit = min(100000, max(1, request.args.get('limit', 200, type=int)))
+    order = request.args.get('order', 'asc').lower()
+    if order not in ('asc', 'desc'):
+        order = 'asc'
+
+    db = get_files_db()
+    if not db:
+        return jsonify({'error': 'no files DB'}), 503
+
+    base = DRIVE_GP_PREFIX + (path + '/' if path else '')
+    path_like = base + '%'
+    if recursive:
+        extra_path_exclude = ''
+        path_params = [path_like]
+    else:
+        # Only files directly in current dir — no further '/' after base
+        extra_path_exclude = " AND instr(substr(f.path, ?+1), '/') = 0"
+        path_params = [path_like, len(base)]
+
+    # Extension filter by view
+    if view == 'all':
+        ext_clause = ''  # no filter — everything (photos+videos+raw+other)
+    elif view in _DRIVE_VIEW_EXTS:
+        ext_set = _DRIVE_VIEW_EXTS[view]
+        ext_list = "','".join(ext_set)
+        ext_clause = f" AND lower(f.extension) IN ('{ext_list}')"
+    else:  # 'other' — anything not in the three known media buckets
+        all_known = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS | RAW_EXTENSIONS
+        ext_list = "','".join(all_known)
+        ext_clause = f" AND lower(f.extension) NOT IN ('{ext_list}')"
+
+    sort_dir = 'DESC' if order == 'desc' else 'ASC'
+    sql = f"""
+        SELECT f.id, f.filename, f.extension, f.size_bytes, f.source_archive,
+               f.extracted, f.modified_at, f.path
+        FROM files f
+        WHERE f.path LIKE ?{extra_path_exclude}{ext_clause}
+        ORDER BY lower(f.filename) {sort_dir}, f.id {sort_dir}
+        LIMIT ? OFFSET ?
+    """
+    rows = db.execute(sql, path_params + [limit, offset]).fetchall()
+    has_more = len(rows) == limit
+    thumbs_dir = Path(app.static_folder) / 'thumbs'
+
+    items = []
+    for r in rows:
+        thumb_path = thumbs_dir / f"{r['id']}.jpg"
+        # relpath: path relative to current folder (sub-dir + filename)
+        full_path = r['path'] or ''
+        relpath = full_path[len(base):] if full_path.startswith(base) else full_path
+        items.append({
+            'file_id': r['id'],
+            'filename': r['filename'],
+            'ext': (r['extension'] or '').lower(),
+            'modified_at': r['modified_at'],
+            'size_bytes': r['size_bytes'],
+            'source_archive': (r['source_archive'] or '').replace('takeout-20260126T191854Z-', ''),
+            'extracted': bool(r['extracted']),
+            'has_thumb': thumb_path.exists(),
+            'relpath': relpath,
+        })
+    return jsonify({'items': items, 'offset': offset, 'limit': limit,
+                    'returned': len(items), 'has_more': has_more})
 
 
 @app.route('/files/zips')
@@ -2467,14 +2862,15 @@ def deletion_status_set():
     status = data.get('status', 'pending')
     if not year or not month:
         return jsonify({'error': 'year and month required'}), 400
-    if status not in ('pending', 'reviewed', 'deleted', 'verified'):
+    # 'src_deleted' = removed from the source (Google Photos); the local backup is untouched.
+    if status not in MONTH_FLAGS:
         return jsonify({'error': 'invalid status'}), 400
 
     count_local = data.get('count_local')
     count_google = data.get('count_google')
     bytes_freed = data.get('bytes_freed')
     note = data.get('note', '')
-    deleted_at = datetime.utcnow().isoformat() if status in ('deleted', 'verified') else None
+    deleted_at = datetime.utcnow().isoformat() if status in ('src_deleted', 'verified') else None
 
     ddb = get_deletion_db()
     ddb.execute("""
@@ -2490,6 +2886,20 @@ def deletion_status_set():
             note=excluded.note,
             updated_at=CURRENT_TIMESTAMP
     """, (int(year), int(month), status, count_local, count_google, bytes_freed, deleted_at, note))
+    # Cascade: apply the same flag to every photo in this month.
+    cascaded = 0
+    fdb = get_files_db()
+    if fdb:
+        photo_ids = _photo_ids_for_month(fdb, int(year), int(month))
+        for fid in photo_ids:
+            ddb.execute("""
+                INSERT INTO photo_review (file_id, status, reviewed_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    status = excluded.status,
+                    reviewed_at = CURRENT_TIMESTAMP
+            """, (fid, status))
+        cascaded = len(photo_ids)
     ddb.commit()
     row = ddb.execute(
         "SELECT * FROM deletion_log WHERE year = ? AND month = ?",
@@ -2499,8 +2909,10 @@ def deletion_status_set():
                f'photos:{int(year)}:{int(month):02d}',
                {'status': status, 'count_local': count_local,
                 'count_google': count_google, 'bytes_freed': bytes_freed,
-                'note': note})
-    return jsonify(dict(row))
+                'note': note, 'cascaded_photos': cascaded})
+    result = dict(row)
+    result['cascaded'] = cascaded
+    return jsonify(result)
 
 
 @app.route('/api/files/extract', methods=['POST'])
@@ -2904,7 +3316,7 @@ def main():
     print(f"Database: {DB_PATH}")
     print(f"URL: http://{args.host}:{args.port}")
 
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 
 if __name__ == '__main__':

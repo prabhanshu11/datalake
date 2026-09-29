@@ -42,3 +42,7 @@ progress_actual.md
 
 # Generated photo thumbnails (rebuild via deletion/scripts/build_thumbs.py)
 web/static/thumbs/
+
+# Generated photo thumbnails (personal photos, ~500 MB) — never in git
+web/static/thumbs/
+web/static/thumbs.orphaned-bak/

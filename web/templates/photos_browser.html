@@ -27,10 +27,31 @@
     .chip .count { opacity: 0.7; font-size: 0.7rem; margin-left: 0.2rem; }
 
     /* Deletion-status overlays for month chips */
-    .chip.del-reviewed { border-color: #f0883e; box-shadow: inset 3px 0 0 #f0883e; }
-    .chip.del-deleted  { border-color: #3fb950; box-shadow: inset 3px 0 0 #3fb950; }
-    .chip.del-verified { background: #238636; border-color: #238636; color: #fff; }
-    .chip.del-deleted .count, .chip.del-verified .count { color: #c9d1d9; }
+    .chip.del-reviewed    { border-color: #f0883e; box-shadow: inset 3px 0 0 #f0883e; }
+    .chip.del-flagged     { border-color: #e3b341; box-shadow: inset 3px 0 0 #e3b341; }
+    .chip.del-keep        { border-color: #58a6ff; box-shadow: inset 3px 0 0 #58a6ff; }
+    .chip.del-src_deleted { border-color: #3fb950; box-shadow: inset 3px 0 0 #3fb950; }
+    .chip.del-verified    { background: #238636; border-color: #238636; color: #fff; }
+    .chip.del-src_deleted .count, .chip.del-verified .count { color: #c9d1d9; }
+
+    /* photo-tile status dots — extended for cascaded flags */
+    .ptile.rs-src_deleted .pstatus { background: #3fb950; }
+    .ptile.rs-verified    .pstatus { background: #238636; }
+
+    /* Month-panel flag buttons */
+    .flagbtns { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.25rem; }
+    .flagbtn {
+        padding: 0.3rem 0.7rem; border-radius: 4px; font-size: 0.8rem; cursor: pointer;
+        border: 1px solid #30363d; background: #161b22; color: #8b949e;
+        transition: border-color 0.15s, color 0.15s;
+    }
+    .flagbtn:hover { border-color: #58a6ff; color: #e6edf3; }
+    .flagbtn[data-flag="pending"].active    { border-color: #484f58; color: #e6edf3; background: #21262d; }
+    .flagbtn[data-flag="reviewed"].active   { border-color: #f0883e; color: #f0883e; }
+    .flagbtn[data-flag="flagged"].active    { border-color: #e3b341; color: #e3b341; }
+    .flagbtn[data-flag="keep"].active       { border-color: #58a6ff; color: #58a6ff; }
+    .flagbtn[data-flag="src_deleted"].active{ border-color: #3fb950; color: #3fb950; }
+    .flagbtn[data-flag="verified"].active   { background: #238636; border-color: #238636; color: #fff; }
 
     /* Mark-this-month panel */
     .mark-panel {
@@ -146,7 +167,7 @@
 <div class="year-chips">
     {% for y in years %}
     <a href="/files/photos?year={{ y.year }}&view={{ current_view }}"
-       class="chip {% if current_year == y.year %}active{% endif %}">
+       class="chip {% if current_year == y.year %}active{% endif %} {% if y.year in years_done %}del-src_deleted{% endif %}">
         {{ y.year }} <span class="count">({{ y.count }})</span>
     </a>
     {% endfor %}
@@ -187,7 +208,7 @@
 <div style="margin-bottom: 0.5rem; color: #8b949e; font-size: 0.85rem;">
     {{ total }} items
     {% if current_month %} in {{ month_names[current_month-1] }} {{ current_year }}{% else %} in {{ current_year }}{% endif %}
-    &middot; Page {{ page }} of {{ ((total - 1) // per_page) + 1 if total > 0 else 1 }}
+    {% if current_view != 'photos' %}&middot; Page {{ page }} of {{ ((total - 1) // per_page) + 1 if total > 0 else 1 }}{% endif %}
 </div>
 
 {% if current_month %}
@@ -200,15 +221,16 @@
     <input type="hidden" name="month" value="{{ current_month }}">
     <input type="hidden" name="count_local" value="{{ total }}">
 
-    <div>
-        <label>Status</label>
-        <select name="status">
-            {% set cur_status = (current_deletion.status if current_deletion else 'pending') %}
-            <option value="pending"  {% if cur_status=='pending'  %}selected{% endif %}>pending</option>
-            <option value="reviewed" {% if cur_status=='reviewed' %}selected{% endif %}>reviewed</option>
-            <option value="deleted"  {% if cur_status=='deleted'  %}selected{% endif %}>deleted</option>
-            <option value="verified" {% if cur_status=='verified' %}selected{% endif %}>verified</option>
-        </select>
+    {% set cur_status = (current_deletion.status if current_deletion else 'pending') %}
+    <input type="hidden" name="status" id="monthStatus" value="{{ cur_status }}">
+    <div class="full">
+        <label>Flag</label>
+        <div class="flagbtns">
+            {% for flag, label in [('pending','pending'),('reviewed','reviewed'),('flagged','flagged'),('keep','keep'),('src_deleted','deleted from src'),('verified','verified')] %}
+            <button type="button" class="flagbtn {% if cur_status == flag %}active{% endif %}"
+                    data-flag="{{ flag }}">{{ label }}</button>
+            {% endfor %}
+        </div>
     </div>
     <div>
         <label>Google count</label>
@@ -232,10 +254,13 @@
     </div>
     <div class="full" id="markStatus">
         {% if current_deletion %}
-        <span class="saved-tag">Saved {{ current_deletion.updated_at }} &middot; status: {{ current_deletion.status }}{% if current_deletion.deleted_at %} &middot; deleted {{ current_deletion.deleted_at }}{% endif %}</span>
+        <span class="saved-tag">Saved {{ current_deletion.updated_at }} &middot; status: {{ 'deleted from src' if current_deletion.status == 'src_deleted' else current_deletion.status }}{% if current_deletion.deleted_at %} &middot; src-deleted {{ current_deletion.deleted_at }}{% endif %}</span>
         {% else %}
         <span class="saved-tag warn">No log entry yet for {{ month_names[current_month-1] }} {{ current_year }}</span>
         {% endif %}
+    </div>
+    <div class="full" id="reviewRollup" style="font-size:0.8rem; color:#8b949e; margin-top:-0.2rem;">
+        <!-- filled by loadReviewRollup(): per-photo flag rollup -->
     </div>
 </form>
 {% endif %}
@@ -371,6 +396,8 @@
         <option value="reviewed">reviewed</option>
         <option value="flagged">flagged</option>
         <option value="keep">keep (don't delete)</option>
+        <option value="src_deleted">deleted from src</option>
+        <option value="verified">verified</option>
         <option value="pending">pending (clear)</option>
     </select>
     <input id="bulkNote" placeholder="optional note" />
@@ -415,7 +442,7 @@
     const bulkCount = document.getElementById('bulkCount');
     const year = grid.dataset.year;
     const month = grid.dataset.month;
-    const LIMIT = 200;
+    const LIMIT = 500;  // chunked loading; backend returns has_more flag
     let offset = 0;
     let loading = false;
     let done = false;
@@ -482,7 +509,7 @@
     function applyStatus(fid, status, note, reviewedAt) {
         const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
         if (!t) return;
-        t.classList.remove('rs-reviewed','rs-flagged','rs-keep');
+        t.classList.remove('rs-reviewed','rs-flagged','rs-keep','rs-src_deleted','rs-verified');
         if (status && status !== 'pending') {
             t.classList.add('rs-' + status);
         }
@@ -511,13 +538,15 @@
                 return;
             }
             grid.insertAdjacentHTML('beforeend', items.map(tile).join(''));
-            offset += items.length;
-            statusDiv.textContent = `${offset} loaded — scroll for more`;
+            // SQL OFFSET is based on raw rows; advance by chunk size, not dedup-shrunk count
+            offset += LIMIT;
             // Fetch review statuses for newly inserted tiles
             fetchReviewStatuses(items.map(it => it.file_id));
-            if (items.length < LIMIT) {
+            if (!data.has_more) {
                 done = true;
-                statusDiv.textContent = `End of list — ${offset} loaded.`;
+                statusDiv.textContent = `End of list — ${grid.children.length} tiles loaded.`;
+            } else {
+                statusDiv.textContent = `${grid.children.length} tiles loaded — scroll for more`;
             }
         } catch (e) {
             statusDiv.textContent = 'Error: ' + e.message;
@@ -748,6 +777,31 @@
         }
     });
 
+    // Per-photo flag rollup shown in the month panel — reflects photo_review
+    // so the panel is never silently empty even without a deletion_log row.
+    async function loadReviewRollup() {
+        const el = document.getElementById('reviewRollup');
+        if (!el) return;
+        try {
+            const r = await fetch('/api/photos/review/rollup?year={{ current_year }}&month={{ current_month }}');
+            const d = await r.json();
+            if (d.error) return;
+            const LABELS = {reviewed:'reviewed', flagged:'flagged', keep:'keep',
+                            src_deleted:'deleted from src', verified:'verified', pending:'pending'};
+            const parts = [];
+            for (const [k, lbl] of Object.entries(LABELS)) {
+                if (d[k]) parts.push(d[k] + ' ' + lbl);
+            }
+            const handled = d.total - (d.unflagged || 0) - (d.pending || 0);
+            const detail = parts.length ? parts.join(' · ') : 'none flagged yet';
+            el.innerHTML = '<strong>Per-photo flags:</strong> ' + detail
+                + (d.unflagged ? ' · ' + d.unflagged + ' unflagged' : '')
+                + ' — <strong>' + handled + '/' + d.total + '</strong> photos handled';
+            el.style.color = (d.total > 0 && handled === d.total) ? '#3fb950' : '#8b949e';
+        } catch (e) { /* leave panel as-is on error */ }
+    }
+    loadReviewRollup();
+
     // Bulk apply
     document.getElementById('bulkApply').addEventListener('click', async () => {
         if (!selected.size) return;
@@ -775,6 +829,7 @@
         visibleIds.forEach(fid => applyStatus(String(fid), status, note, now));
         noteInput.value = '';
         clearSelection();
+        loadReviewRollup();  // refresh the month-panel rollup after flagging
     });
     document.getElementById('bulkClear').addEventListener('click', clearSelection);
 
@@ -912,8 +967,8 @@
 {% endif %}
 {% endif %}
 
-<!-- Pagination -->
-{% if total > per_page %}
+<!-- Pagination (only for non-photos views; photos view loads all via JS) -->
+{% if current_view != 'photos' and total > per_page %}
 <div class="pagination" style="margin-top: 1rem;">
     {% if page > 1 %}
     <a href="/files/photos?year={{ current_year }}&view={{ current_view }}{% if current_month %}&month={{ current_month }}{% endif %}&page={{ page - 1 }}">Previous</a>
@@ -926,6 +981,17 @@
 {% endif %}
 
 <script>
+// Flag-button click → set hidden status input and save
+document.querySelectorAll('.flagbtn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const flag = btn.dataset.flag;
+        document.getElementById('monthStatus').value = flag;
+        document.querySelectorAll('.flagbtn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        saveDeletion({preventDefault: () => {}});
+    });
+});
+
 function saveDeletion(ev) {
     ev.preventDefault();
     const f = document.getElementById('markPanel');
@@ -952,10 +1018,15 @@ function saveDeletion(ev) {
         if (data.error) {
             status.innerHTML = '<span class="saved-tag warn">Error: ' + data.error + '</span>';
         } else {
-            status.innerHTML = '<span class="saved-tag">Saved &middot; status: ' + data.status +
-                (data.deleted_at ? ' &middot; deleted ' + data.deleted_at : '') + '</span>';
+            const ST_LABELS = {src_deleted: 'deleted from src', verified: 'verified',
+                               reviewed: 'reviewed', flagged: 'flagged', keep: 'keep', pending: 'pending'};
+            const stLabel = ST_LABELS[data.status] || data.status;
+            const cascadeNote = data.cascaded ? ' &middot; ' + data.cascaded + ' photos updated' : '';
+            status.innerHTML = '<span class="saved-tag">Saved &middot; status: ' + stLabel +
+                (data.deleted_at ? ' &middot; src-deleted ' + data.deleted_at : '') +
+                cascadeNote + '</span>';
             // Reload to refresh month-chip styling
-            setTimeout(() => location.reload(), 600);
+            setTimeout(() => location.reload(), 800);
         }
     })
     .catch(err => {

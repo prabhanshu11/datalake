@@ -1,0 +1,614 @@
+{% extends "base.html" %}
+
+{% block title %}Drive Browser - Datalake{% endblock %}
+
+{% block content %}
+<style>
+    .folder-chips, .view-tabs {
+        display: flex;
+        gap: 0.35rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+    }
+    .chip {
+        display: inline-block;
+        padding: 0.3rem 0.7rem;
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        font-size: 0.8rem;
+        color: #8b949e;
+        text-decoration: none;
+        cursor: pointer;
+    }
+    .chip:hover { background: #30363d; color: #c9d1d9; }
+    .chip.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+    .chip.disabled { opacity: 0.3; pointer-events: none; }
+    .chip .count { opacity: 0.7; font-size: 0.7rem; margin-left: 0.2rem; }
+    .chip.del-reviewed    { border-color: #f0883e; box-shadow: inset 3px 0 0 #f0883e; }
+    .chip.del-flagged     { border-color: #e3b341; box-shadow: inset 3px 0 0 #e3b341; }
+    .chip.del-keep        { border-color: #58a6ff; box-shadow: inset 3px 0 0 #58a6ff; }
+    .chip.del-src_deleted { border-color: #3fb950; box-shadow: inset 3px 0 0 #3fb950; }
+    .chip.del-verified    { background: #238636; border-color: #238636; color: #fff; }
+
+    .ptile.rs-src_deleted .pstatus { background: #3fb950; }
+    .ptile.rs-verified    .pstatus { background: #238636; }
+
+    .view-tab { padding: 0.4rem 1rem; font-size: 0.85rem; }
+    .view-tab.active { background: #238636; border-color: #238636; }
+
+    .section-label {
+        font-weight: 600;
+        color: #8b949e;
+        font-size: 0.8rem;
+        margin-bottom: 0.35rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .breadcrumbs {
+        font-size: 0.9rem;
+        margin-bottom: 0.75rem;
+        color: #8b949e;
+    }
+    .breadcrumbs a { color: #58a6ff; text-decoration: none; }
+    .breadcrumbs a:hover { text-decoration: underline; }
+    .breadcrumbs .sep { color: #484f58; margin: 0 0.3rem; }
+    .breadcrumbs .current { color: #c9d1d9; font-weight: 600; }
+
+    .subfolder-chip { display: inline-flex; align-items: center; gap: 0.25rem; }
+    .subfolder-chip .icon { opacity: 0.6; }
+
+    .recursive-toggle {
+        display: inline-flex; align-items: center; gap: 0.4rem;
+        margin-left: 0.5rem; color: #8b949e; font-size: 0.8rem;
+    }
+    .recursive-toggle input { accent-color: #1f6feb; }
+
+    /* Tile grid - identical to photos_browser */
+    .pgrid-wrap { position: relative; user-select: none; }
+    .pgrid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 6px;
+        margin-bottom: 1rem;
+    }
+    .ptile {
+        position: relative;
+        aspect-ratio: 1 / 1;
+        background: #161b22;
+        border: 2px solid #30363d;
+        border-radius: 4px;
+        overflow: hidden;
+        cursor: pointer;
+    }
+    .ptile img { width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-drag: none; pointer-events: none; }
+    .ptile { -webkit-user-drag: none; user-select: none; }
+    .ptile * { pointer-events: none; }
+    .ptile.focused { outline: 2px solid #f0883e; outline-offset: -2px; }
+    .ptile .ph-placeholder {
+        width: 100%; height: 100%;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 0.65rem; color: #484f58; padding: 0.5rem;
+        text-align: center; word-break: break-all;
+    }
+    .ptile .pcap {
+        position: absolute; bottom: 0; left: 0; right: 0;
+        background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+        color: #fff; font-size: 0.65rem; padding: 0.4rem 0.4rem 0.3rem;
+        line-height: 1.2; pointer-events: none;
+    }
+    .ptile .pcap .pdate { opacity: 0.85; }
+    .ptile .pcap .ppath { opacity: 0.6; font-size: 0.6rem; word-break: break-all; }
+    .ptile .ptype-badge {
+        position: absolute; top: 4px; right: 4px;
+        padding: 1px 5px; border-radius: 3px;
+        font-size: 0.6rem; background: rgba(0,0,0,0.7); color: #fff;
+    }
+    .ptile .pstatus {
+        position: absolute; bottom: 4px; right: 4px;
+        width: 14px; height: 14px; border-radius: 50%;
+        border: 2px solid #0d1117;
+        z-index: 2;
+    }
+    .ptile.rs-reviewed .pstatus { background: #3fb950; }
+    .ptile.rs-flagged  .pstatus { background: #f0883e; }
+    .ptile.rs-keep     .pstatus { background: #1f6feb; }
+    .ptile:not(.rs-reviewed):not(.rs-flagged):not(.rs-keep):not(.rs-src_deleted):not(.rs-verified) .pstatus { display: none; }
+    .ptile.selected { border-color: #1f6feb; box-shadow: 0 0 0 2px #1f6feb; }
+    #marquee {
+        position: absolute; pointer-events: none;
+        background: rgba(31, 111, 235, 0.15);
+        border: 1px solid #1f6feb;
+        z-index: 5;
+        display: none;
+    }
+    #bulkBar {
+        position: sticky; top: 0; z-index: 50;
+        background: #161b22; border: 1px solid #1f6feb;
+        border-radius: 6px;
+        padding: 0.55rem 0.85rem;
+        margin-bottom: 0.5rem;
+        display: none;
+        flex-wrap: wrap; gap: 0.5rem; align-items: center;
+        font-size: 0.85rem;
+    }
+    #bulkBar .count { color: #58a6ff; font-weight: 600; }
+    #bulkBar select, #bulkBar input {
+        background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+        border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.8rem;
+    }
+    #bulkBar input { flex: 1; min-width: 200px; }
+    #bulkBar button {
+        background: #238636; border: 1px solid #2ea043; color: white;
+        padding: 0.35rem 0.85rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem;
+    }
+    #bulkBar button.clear {
+        background: transparent; border-color: #30363d; color: #8b949e;
+    }
+    #pgridStatus { color: #8b949e; font-size: 0.85rem; padding: 1rem 0; text-align: center; }
+    #pgridSentinel { height: 40px; }
+    #pmodal {
+        display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92);
+        z-index: 1000; align-items: center; justify-content: center;
+        flex-direction: column; cursor: pointer;
+    }
+    #pmodal.open { display: flex; }
+    #pmodalBody { max-width: 92vw; max-height: 82vh; position: relative; }
+    #pmodalBody img { max-width: 92vw; max-height: 82vh; display: block; }
+    #pmodalCaption { color: #c9d1d9; font-size: 0.85rem; margin-top: 0.6rem; text-align: center; max-width: 92vw; }
+    .keymap { color: #484f58; font-size: 0.7rem; margin-bottom: 0.4rem; }
+</style>
+
+{% set qs_view = '&view=' ~ current_view %}
+{% set qs_recursive = '' if recursive else '&recursive=0' %}
+
+<h1>Drive Browser
+    <span style="font-size: 0.7rem; color: #8b949e; font-weight: normal; margin-left: 0.5rem;">
+        Takeout/Drive/&hellip; ({{ total_count }} files, {{ total_size_gb }} GB total)
+    </span>
+</h1>
+
+<!-- Breadcrumb -->
+<div class="breadcrumbs">
+    {% for c in crumbs %}
+        {% if loop.last %}
+            <span class="current">{{ c.name }}</span>
+        {% else %}
+            <a href="/files/drive?path={{ c.path|urlencode }}{{ qs_view }}{{ qs_recursive }}">{{ c.name }}</a>
+            <span class="sep">/</span>
+        {% endif %}
+    {% endfor %}
+</div>
+
+<!-- Sub-folder chips -->
+<div class="section-label">
+    Sub-folders
+    {% if subfolders %}({{ subfolders|length }}){% else %}— none, this is a leaf folder{% endif %}
+</div>
+<div class="folder-chips">
+    {% if current_path %}
+    {# 'Up' chip: go to parent #}
+    {% set parent_path = current_path.rsplit('/', 1)[0] if '/' in current_path else '' %}
+    <a href="/files/drive?path={{ parent_path|urlencode }}{{ qs_view }}{{ qs_recursive }}" class="chip" title="Go up">
+        &uarr; up
+    </a>
+    {% endif %}
+    {% for sf in subfolders %}
+    {% set child_path = (current_path + '/' + sf.name) if current_path else sf.name %}
+    <a href="/files/drive?path={{ child_path|urlencode }}{{ qs_view }}{{ qs_recursive }}" class="chip subfolder-chip">
+        <span class="icon">📁</span>{{ sf.name }}
+        <span class="count">({{ sf.count }} · {{ sf.size_gb }} GB)</span>
+    </a>
+    {% endfor %}
+    {% if direct.count > 0 %}
+    {# Clicking "direct files" stays in current folder but flips recursive=0 — shows ONLY files at this level. #}
+    <a href="/files/drive?path={{ current_path|urlencode }}{{ qs_view }}&recursive=0"
+       class="chip subfolder-chip {% if not recursive %}active{% endif %}"
+       title="Show only files directly in this folder (no sub-folders)">
+        <span class="icon">📄</span>direct files
+        <span class="count">({{ direct.count }} · {{ direct.size_gb }} GB)</span>
+    </a>
+    {% endif %}
+</div>
+
+<!-- View tabs (filter by extension class) — 'All' is the default to mirror
+     how drive.google.com shows folders (everything together) -->
+<div class="view-tabs">
+    {% for v, label in [('all','All'),('photos','Photos'),('videos','Videos'),('raw','RAW'),('other','Other')] %}
+    <a href="/files/drive?path={{ current_path|urlencode }}&view={{ v }}{{ qs_recursive }}"
+       class="chip view-tab {% if current_view == v %}active{% endif %}">
+        {{ label }} <span class="count">({{ view_counts[v] }})</span>
+    </a>
+    {% endfor %}
+    <label class="recursive-toggle" title="Recursive: include files in all sub-folders. Otherwise only files directly in this folder.">
+        <input type="checkbox" id="recursiveCheck" {% if recursive %}checked{% endif %}>
+        recursive
+    </label>
+</div>
+
+<div style="margin-bottom: 0.5rem; color: #8b949e; font-size: 0.85rem;">
+    {{ total }} {{ current_view }} files
+    {% if recursive %}under{% else %}directly in{% endif %}
+    <code>{{ folder_label or 'Takeout/Drive/' }}</code>
+</div>
+
+<div id="bulkBar">
+    <span><span class="count" id="bulkCount">0</span> selected</span>
+    <select id="bulkStatus">
+        <option value="reviewed">reviewed</option>
+        <option value="flagged">flagged</option>
+        <option value="keep">keep (don't delete)</option>
+        <option value="src_deleted">deleted from src</option>
+        <option value="verified">verified</option>
+        <option value="pending">pending (clear)</option>
+    </select>
+    <input id="bulkNote" placeholder="optional note" />
+    <button id="bulkApply">Apply</button>
+    <button class="clear" id="bulkClear">Clear selection</button>
+</div>
+
+<div style="display:flex; align-items:center; gap:0.6rem; margin: 0.25rem 0 0.5rem; flex-wrap:wrap;">
+    <button id="sortBtn" class="chip view-tab"
+        style="cursor:pointer; padding:0.35rem 0.7rem; font-size:0.8rem;"
+        title="Toggle sort order">
+        Sort: <span id="sortDirLabel">A → Z (filename)</span>
+    </button>
+    <div class="keymap" style="margin:0;">
+        Tip: click-and-drag to marquee-select · Ctrl+A select all loaded · Shift-click to toggle · Arrow keys navigate · Enter opens · Esc clears
+    </div>
+</div>
+
+<div class="pgrid-wrap" id="pgridWrap">
+    <div id="pgrid" class="pgrid"
+         data-path="{{ current_path }}"
+         data-view="{{ current_view }}"
+         data-recursive="{{ '1' if recursive else '0' }}"
+         data-base-len="{{ (folder_label or '')|length }}"></div>
+    <div id="marquee"></div>
+</div>
+<div id="pgridSentinel"></div>
+<div id="pgridStatus">Loading…</div>
+
+<div id="pmodal">
+    <div id="pmodalBody"></div>
+    <div id="pmodalCaption"></div>
+</div>
+
+<script>
+(function() {
+    const grid = document.getElementById('pgrid');
+    const wrap = document.getElementById('pgridWrap');
+    const marquee = document.getElementById('marquee');
+    const sentinel = document.getElementById('pgridSentinel');
+    const statusDiv = document.getElementById('pgridStatus');
+    const bulkBar = document.getElementById('bulkBar');
+    const bulkCount = document.getElementById('bulkCount');
+    const path = grid.dataset.path;
+    const view = grid.dataset.view;
+    const recursive = grid.dataset.recursive;
+    const baseLen = parseInt(grid.dataset.baseLen, 10);
+    const LIMIT = 500;
+    let offset = 0;
+    let loading = false;
+    let done = false;
+    let sortOrder = (new URLSearchParams(location.search).get('order') || 'asc');
+    const selected = new Set();
+    let suppressNextClick = false;
+
+    // Recursive toggle in URL
+    document.getElementById('recursiveCheck').addEventListener('change', (ev) => {
+        const url = new URL(location.href);
+        if (ev.target.checked) url.searchParams.delete('recursive');
+        else url.searchParams.set('recursive', '0');
+        location.href = url.toString();
+    });
+
+    function fmtBytes(n) {
+        if (!n) return '';
+        if (n > 1e9) return (n/1e9).toFixed(2)+' GB';
+        if (n > 1e6) return (n/1e6).toFixed(1)+' MB';
+        if (n > 1e3) return (n/1e3).toFixed(0)+' KB';
+        return n+' B';
+    }
+
+    function tile(it) {
+        const ext = (it.ext || '').replace('.','').toUpperCase();
+        const dateStr = it.modified_at ? it.modified_at.slice(0,10) : '—';
+        const visual = it.has_thumb
+            ? `<img loading="lazy" src="/static/thumbs/${it.file_id}.jpg" alt="">`
+            : `<div class="ph-placeholder">${it.filename}</div>`;
+        const isRaw = /\.(dng|raf|cr2|arw|nef|orf|rw2|heic|heif)$/i.test(it.filename);
+        const typeBadge = isRaw ? `<span class="ptype-badge">${ext}</span>` : '';
+        // For recursive view, also show the sub-path inside the current folder
+        // (helps user see WHERE a file lives without opening it).
+        const relPath = it.relpath || '';
+        return `<div class="ptile" data-fid="${it.file_id}" data-fname="${it.filename}" data-arch="${it.source_archive}">
+            ${visual}${typeBadge}
+            <div class="pcap">
+                <div class="pdate">${dateStr}</div>
+                <div class="ppath">${relPath || it.source_archive} · ${fmtBytes(it.size_bytes)}</div>
+            </div>
+            <div class="pstatus" title=""></div>
+        </div>`;
+    }
+
+    async function fetchReviewStatuses(ids) {
+        if (!ids.length) return;
+        try {
+            const resp = await fetch('/api/photos/review?ids=' + ids.join(','));
+            const data = await resp.json();
+            for (const [fid, info] of Object.entries(data || {})) {
+                applyStatus(fid, info.status, info.note, info.reviewed_at);
+            }
+        } catch (e) {}
+    }
+
+    function applyStatus(fid, status, note, reviewedAt) {
+        const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
+        if (!t) return;
+        t.classList.remove('rs-reviewed','rs-flagged','rs-keep','rs-src_deleted','rs-verified');
+        if (status && status !== 'pending') {
+            t.classList.add('rs-' + status);
+        }
+        const dot = t.querySelector('.pstatus');
+        if (dot) {
+            const parts = [status];
+            if (note) parts.push(note);
+            if (reviewedAt) parts.push(reviewedAt);
+            dot.title = parts.join(' — ');
+        }
+    }
+
+    async function loadMore() {
+        if (loading || done) return;
+        loading = true;
+        statusDiv.textContent = 'Loading…';
+        const url = `/api/drive/list?path=${encodeURIComponent(path)}&view=${encodeURIComponent(view)}` +
+                    `&recursive=${recursive}&offset=${offset}&limit=${LIMIT}&order=${sortOrder}`;
+        try {
+            const resp = await fetch(url);
+            const data = await resp.json();
+            const items = data.items || [];
+            if (items.length === 0) {
+                done = true;
+                statusDiv.textContent = offset === 0 ? 'No files in this selection.' : `End of list — ${offset} loaded.`;
+                return;
+            }
+            grid.insertAdjacentHTML('beforeend', items.map(tile).join(''));
+            offset += LIMIT;
+            fetchReviewStatuses(items.map(it => it.file_id));
+            if (!data.has_more) {
+                done = true;
+                statusDiv.textContent = `End of list — ${grid.children.length} tiles loaded.`;
+            } else {
+                statusDiv.textContent = `${grid.children.length} tiles loaded — scroll for more`;
+            }
+        } catch (e) {
+            statusDiv.textContent = 'Error: ' + e.message;
+        } finally {
+            loading = false;
+        }
+    }
+
+    const io = new IntersectionObserver(entries => {
+        if (entries[0].isIntersecting) loadMore();
+    }, {rootMargin: '600px'});
+    io.observe(sentinel);
+
+    function updateSortLabel() {
+        document.getElementById('sortDirLabel').textContent =
+            sortOrder === 'asc' ? 'A → Z (filename)' : 'Z → A (filename)';
+    }
+    function reloadGrid() {
+        offset = 0; done = false;
+        clearSelection();
+        grid.innerHTML = '';
+        statusDiv.textContent = 'Loading…';
+        loadMore();
+    }
+    document.getElementById('sortBtn').addEventListener('click', () => {
+        sortOrder = (sortOrder === 'asc') ? 'desc' : 'asc';
+        updateSortLabel();
+        reloadGrid();
+    });
+    updateSortLabel();
+    loadMore();
+
+    // ---- Selection ----
+    function setSelected(fid, on) {
+        const t = grid.querySelector(`.ptile[data-fid="${fid}"]`);
+        if (!t) return;
+        if (on) { selected.add(fid); t.classList.add('selected'); }
+        else    { selected.delete(fid); t.classList.remove('selected'); }
+    }
+    function clearSelection() {
+        for (const fid of Array.from(selected)) setSelected(fid, false);
+        renderBulk();
+    }
+    function renderBulk() {
+        if (selected.size === 0) {
+            bulkBar.style.display = 'none';
+        } else {
+            bulkBar.style.display = 'flex';
+            bulkCount.textContent = selected.size;
+        }
+    }
+
+    // ---- Marquee selection ----
+    let dragOrigin = null, dragStartedOn = null, isDragging = false, baseSelection = null;
+    const DRAG_THRESHOLD = 5;
+
+    wrap.addEventListener('mousedown', ev => {
+        if (ev.button !== 0) return;
+        const r = wrap.getBoundingClientRect();
+        dragOrigin = {x: ev.clientX - r.left, y: ev.clientY - r.top, sx: ev.clientX, sy: ev.clientY};
+        const tile = ev.target.closest('.ptile');
+        dragStartedOn = tile ? tile.dataset.fid : null;
+        isDragging = false;
+        baseSelection = ev.shiftKey ? new Set(selected) : null;
+        marquee.style.display = 'none';
+        ev.preventDefault();
+    });
+
+    function updateMarquee(ev) {
+        if (!dragOrigin) return;
+        const dx = Math.abs(ev.clientX - dragOrigin.sx);
+        const dy = Math.abs(ev.clientY - dragOrigin.sy);
+        if (!isDragging && (dx + dy) < DRAG_THRESHOLD) return;
+        isDragging = true;
+        const r = wrap.getBoundingClientRect();
+        const x = ev.clientX - r.left, y = ev.clientY - r.top;
+        const left = Math.min(x, dragOrigin.x), top = Math.min(y, dragOrigin.y);
+        const w = Math.abs(x - dragOrigin.x), h = Math.abs(y - dragOrigin.y);
+        marquee.style.left = left + 'px';
+        marquee.style.top  = top + 'px';
+        marquee.style.width  = w + 'px';
+        marquee.style.height = h + 'px';
+        marquee.style.display = 'block';
+        const wrapRect = wrap.getBoundingClientRect();
+        const mrect = {
+            left: wrapRect.left + left, top: wrapRect.top + top,
+            right: wrapRect.left + left + w, bottom: wrapRect.top + top + h
+        };
+        const tiles = grid.querySelectorAll('.ptile');
+        const desired = new Set(baseSelection || []);
+        tiles.forEach(t => {
+            const tr = t.getBoundingClientRect();
+            const intersects = !(tr.right < mrect.left || tr.left > mrect.right
+                || tr.bottom < mrect.top || tr.top > mrect.bottom);
+            if (intersects) desired.add(t.dataset.fid);
+        });
+        for (const fid of selected) if (!desired.has(fid)) setSelected(fid, false);
+        for (const fid of desired) if (!selected.has(fid)) setSelected(fid, true);
+        renderBulk();
+    }
+    document.addEventListener('mousemove', updateMarquee);
+
+    document.addEventListener('mouseup', ev => {
+        if (!dragOrigin) return;
+        const wasDragging = isDragging;
+        const startedOn = dragStartedOn;
+        dragOrigin = null;
+        dragStartedOn = null;
+        isDragging = false;
+        marquee.style.display = 'none';
+        if (wasDragging) { suppressNextClick = true; return; }
+        if (startedOn) {
+            const tile = grid.querySelector(`.ptile[data-fid="${startedOn}"]`);
+            if (!tile) return;
+            if (ev.shiftKey) {
+                setSelected(startedOn, !selected.has(startedOn));
+                renderBulk();
+                setFocus(tile);
+                return;
+            }
+            setFocus(tile);
+            openModal(tile);
+        }
+    });
+
+    grid.addEventListener('click', ev => {
+        if (suppressNextClick) { suppressNextClick = false; ev.stopPropagation(); ev.preventDefault(); }
+    }, true);
+
+    let focused = null;
+    function setFocus(t) {
+        if (focused) focused.classList.remove('focused');
+        focused = t;
+        if (t) { t.classList.add('focused'); t.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+    }
+    function tilesArr() { return Array.from(grid.querySelectorAll('.ptile')); }
+    function colsPerRow() {
+        const tiles = tilesArr();
+        if (tiles.length < 2) return 1;
+        const top0 = tiles[0].getBoundingClientRect().top;
+        let cols = 0;
+        for (const t of tiles) {
+            if (Math.abs(t.getBoundingClientRect().top - top0) < 4) cols++;
+            else break;
+        }
+        return Math.max(1, cols);
+    }
+    function moveFocus(delta) {
+        const tiles = tilesArr();
+        if (!tiles.length) return;
+        let idx = focused ? tiles.indexOf(focused) : -1;
+        idx = Math.max(0, Math.min(tiles.length - 1, idx + delta));
+        setFocus(tiles[idx]);
+    }
+    document.addEventListener('keydown', ev => {
+        const modal = document.getElementById('pmodal');
+        const tag = (ev.target.tagName || '').toLowerCase();
+        const inField = (tag === 'input' || tag === 'textarea' || tag === 'select');
+        if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a' && !inField) {
+            ev.preventDefault();
+            for (const t of tilesArr()) setSelected(t.dataset.fid, true);
+            renderBulk();
+            return;
+        }
+        if (ev.key === 'Escape') {
+            if (modal.classList.contains('open')) { modal.classList.remove('open'); }
+            else { clearSelection(); }
+            return;
+        }
+        if (inField) return;
+        if (modal.classList.contains('open')) {
+            if (ev.key === 'ArrowRight' || ev.key === 'ArrowLeft') {
+                ev.preventDefault();
+                moveFocus(ev.key === 'ArrowRight' ? 1 : -1);
+                if (focused) openModal(focused);
+            }
+            return;
+        }
+        const cols = colsPerRow();
+        const map = {ArrowRight: 1, ArrowLeft: -1, ArrowDown: cols, ArrowUp: -cols};
+        if (ev.key in map) { ev.preventDefault(); moveFocus(map[ev.key]); return; }
+        if (ev.key === 'Enter' && focused) { ev.preventDefault(); openModal(focused); return; }
+        if (ev.key === ' ' && focused) {
+            ev.preventDefault();
+            const fid = focused.dataset.fid;
+            setSelected(fid, !selected.has(fid));
+            renderBulk();
+        }
+    });
+
+    document.getElementById('bulkApply').addEventListener('click', async () => {
+        if (!selected.size) return;
+        const status = document.getElementById('bulkStatus').value;
+        const noteInput = document.getElementById('bulkNote');
+        const note = noteInput.value || null;
+        const idsArr = Array.from(selected).map(s => parseInt(s, 10));
+        const resp = await fetch('/api/photos/review', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({file_ids: idsArr, status, note})
+        });
+        const data = await resp.json();
+        if (data.error) { alert('Error: ' + data.error); return; }
+        const now = new Date().toISOString().replace('T',' ').slice(0,19);
+        Array.from(selected).forEach(fid => applyStatus(String(fid), status, note, now));
+        noteInput.value = '';
+        clearSelection();
+    });
+    document.getElementById('bulkClear').addEventListener('click', clearSelection);
+
+    const modal = document.getElementById('pmodal');
+    const modalBody = document.getElementById('pmodalBody');
+    const modalCap = document.getElementById('pmodalCaption');
+    function openModal(t) {
+        const fid = t.dataset.fid;
+        const fname = t.dataset.fname;
+        const arch = t.dataset.arch;
+        const hasThumb = t.querySelector('img');
+        modalBody.innerHTML = hasThumb
+            ? `<img src="/static/thumbs/${fid}.jpg">`
+            : `<div style="color:#8b949e; padding:2rem; background:#161b22; border-radius:6px;">No thumbnail available for ${fname}</div>`;
+        modalCap.textContent = `${fname} · ${arch} · click to close · Esc to close`;
+        modal.classList.add('open');
+    }
+    modal.addEventListener('click', () => { modal.classList.remove('open'); });
+})();
+</script>
+
+{% endblock %}
