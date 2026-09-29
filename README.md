@@ -656,6 +656,7 @@ export DATA_DIR=/mnt/data-ssd/datalake
 | Source | Where it lives | Why not ingested yet |
 |--------|----------------|----------------------|
 | Keystroke log | `/var/log/keystroke-log/keystroke-YYYY-MM-DD.log` on each machine (root, 0600, kept forever) | Contains every typed password. The datalake DB is synced desktop↔laptop and the API listens on LAN/Tailscale, so ingesting would expose it. |
+| Keystroke log, shareable copy | `/var/log/keystroke-log-shareable/keys-YYYY-MM-DD.log` (user-readable, edits replayed, pass secrets → `⟦secret·xxxx⟧`) | The ingest candidate. Still private text (messages, URLs, non-pass secrets), so it waits for the same access-control gate, minus the redaction step. |
 
 **Gate for ingesting the keystroke log** — all of: a per-source access
 control (or a separate encrypted, local-only table never copied by
