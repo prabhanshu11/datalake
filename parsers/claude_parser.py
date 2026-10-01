@@ -121,6 +121,8 @@ class ClaudeSession:
     tool_events: list[ToolEvent] = field(default_factory=list)
     compaction_events: list[CompactionEvent] = field(default_factory=list)
     file_operations: list[FileOperation] = field(default_factory=list)
+    # (path, signature) of the session file; written to parse_manifest with the session
+    manifest: Optional[tuple] = None
 
 
 @dataclass
@@ -144,16 +146,42 @@ class ClaudeParser:
         self.history_file = self.claude_dir / "history.jsonl"
         self.projects_dir = self.claude_dir / "projects"
 
-    def parse_history(self) -> Iterator[ClaudeHistoryEntry]:
-        """Parse history.jsonl file."""
+    @staticmethod
+    def _head_hash(path: Path, upto: int) -> str:
+        """sha1 of the first min(4096, upto) bytes: the already-ingested prefix only."""
+        import hashlib
+        with open(path, 'rb') as f:
+            return hashlib.sha1(f.read(min(4096, upto))).hexdigest()
+
+    def parse_history(self, start_offset: int = 0, head_hash: Optional[str] = None) -> Iterator[ClaudeHistoryEntry]:
+        """Parse history.jsonl, from start_offset (bytes) when the file was only appended to.
+
+        history.jsonl is append-only; claude_history has no unique key, so re-reading the
+        whole file used to insert every line again on every run (4 219 copies per tick on
+        the desktop). After the generator is exhausted, self.history_state holds
+        (path, end_offset, head_hash) for parse_manifest.
+        """
+        self.history_state = None
         if not self.history_file.exists():
             logger.warning(f"History file not found: {self.history_file}")
             return
 
-        logger.info(f"Parsing history from: {self.history_file}")
+        size = self.history_file.stat().st_size
+        if start_offset and (start_offset > size or
+                             (head_hash and head_hash != self._head_hash(self.history_file, start_offset))):
+            logger.info("history.jsonl was rewritten (smaller or new head); reading it from the start")
+            start_offset = 0
 
-        with open(self.history_file, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
+        logger.info(f"Parsing history from: {self.history_file} (offset {start_offset})")
+
+        with open(self.history_file, 'rb') as f:
+            f.seek(start_offset)
+            end_offset = start_offset
+            for line_num, raw in enumerate(f, 1):
+                if not raw.endswith(b'\n'):
+                    break  # partial last line still being written; next run picks it up
+                end_offset += len(raw)
+                line = raw.decode('utf-8', errors='replace')
                 try:
                     data = json.loads(line.strip())
 
@@ -179,6 +207,7 @@ class ClaudeParser:
                     logger.warning(f"Failed to parse history line {line_num}: {e}")
                 except Exception as e:
                     logger.error(f"Error processing history line {line_num}: {e}")
+        self.history_state = (str(self.history_file), end_offset, self._head_hash(self.history_file, end_offset))
 
     def _extract_content(self, message: dict) -> tuple[str, str, int, int, int, list[dict], list[dict]]:
         """Extract text, thinking, counts, tool_uses, and tool_results from message content."""
@@ -505,8 +534,25 @@ class ClaudeParser:
             file_operations=file_operations,
         )
 
-    def parse_sessions(self) -> Iterator[ClaudeSession]:
-        """Parse all session files from projects directory."""
+    @staticmethod
+    def session_signature(session_file: Path, session_subdir: Path) -> str:
+        """size:mtime_ns of the session file + the names of its subagent files."""
+        st = session_file.stat()
+        names = []
+        if session_subdir.is_dir():
+            for d in (session_subdir / "subagents", session_subdir):
+                if d.is_dir():
+                    names.extend(sorted(p.name for p in d.glob('agent-*.jsonl')))
+        return f"{st.st_size}:{st.st_mtime_ns}:{','.join(names)}"
+
+    def parse_sessions(self, known: Optional[dict] = None) -> Iterator[ClaudeSession]:
+        """Parse session files from the projects directory.
+
+        known: {session_file_path: signature} from parse_manifest; files whose signature
+        is unchanged are skipped (not read, not re-ingested). self.skipped counts them.
+        """
+        known = known or {}
+        self.skipped = 0
         if not self.projects_dir.exists():
             logger.warning(f"Projects directory not found: {self.projects_dir}")
             return
@@ -531,8 +577,16 @@ class ClaudeParser:
 
                 if session_pattern.match(item.name):
                     session_id = item.stem
+                    try:
+                        sig = self.session_signature(item, project_dir / session_id)
+                    except OSError:
+                        continue
+                    if known.get(str(item)) == sig:
+                        self.skipped += 1
+                        continue
                     session = self._parse_session_file(item, session_id, project_name)
                     if session:
+                        session.manifest = (str(item), sig)
                         # Look for subagents in both locations:
                         # - {session_id}/subagents/agent-*.jsonl (current Claude Code format)
                         # - {session_id}/agent-*.jsonl (legacy format)
@@ -586,8 +640,41 @@ class DatalakeIngester:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
+        # Which source files are already ingested, and in what state (size:mtime_ns,
+        # history byte offset). Lets every run skip unchanged files instead of
+        # re-upserting every message (each upsert rewrote its FTS5 entry).
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS parse_manifest (
+                path TEXT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.commit()
+
+    def manifest(self) -> dict:
+        return {r['path']: r['signature'] for r in self.conn.execute('SELECT path, signature FROM parse_manifest')}
+
+    def _set_manifest(self, path: str, signature: str):
+        self.conn.execute(
+            'INSERT INTO parse_manifest (path, signature, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) '
+            'ON CONFLICT(path) DO UPDATE SET signature = excluded.signature, updated_at = excluded.updated_at',
+            (path, signature))
+
+    def history_offset(self, history_path: str) -> tuple:
+        row = self.conn.execute('SELECT signature FROM parse_manifest WHERE path = ?', (history_path,)).fetchone()
+        if not row:
+            return 0, None
+        offset, _, head = row['signature'].partition(':')
+        return int(offset), head or None
+
+    def save_history_state(self, state: Optional[tuple]):
+        if state:
+            path, offset, head = state
+            self._set_manifest(path, f"{offset}:{head}")
+            self.conn.commit()
 
     def ingest_history(self, entries: Iterator[ClaudeHistoryEntry]) -> int:
         """Ingest history entries into the database."""
@@ -696,6 +783,11 @@ class DatalakeIngester:
                         content_tool_uses = excluded.content_tool_uses,
                         content_tool_results = excluded.content_tool_results,
                         metadata = excluded.metadata
+                    WHERE content_text IS NOT excluded.content_text
+                       OR content_thinking IS NOT excluded.content_thinking
+                       OR content_tool_uses IS NOT excluded.content_tool_uses
+                       OR content_tool_results IS NOT excluded.content_tool_results
+                       OR metadata IS NOT excluded.metadata
                 ''', (
                     session_db_id,
                     msg.message_uuid,
@@ -795,6 +887,8 @@ class DatalakeIngester:
                     fo.timestamp,
                 ))
 
+            if session.manifest:
+                self._set_manifest(*session.manifest)
             self.conn.commit()
             return session_db_id
 
@@ -836,6 +930,11 @@ def main():
         help='Only show statistics, do not ingest'
     )
     parser.add_argument(
+        '--full',
+        action='store_true',
+        help='Ignore parse_manifest: re-read every session file and all of history.jsonl'
+    )
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Verbose output'
@@ -867,20 +966,22 @@ def main():
 
     # Ingest history
     print("Ingesting history...")
-    history_count = ingester.ingest_history(claude_parser.parse_history())
+    offset, head = (0, None) if args.full else ingester.history_offset(str(claude_parser.history_file))
+    history_count = ingester.ingest_history(claude_parser.parse_history(offset, head))
+    ingester.save_history_state(getattr(claude_parser, 'history_state', None))
     print(f"  Ingested {history_count} history entries")
 
     # Ingest sessions
     print("Ingesting sessions...")
     session_count = 0
-    for session in claude_parser.parse_sessions():
+    for session in claude_parser.parse_sessions({} if args.full else ingester.manifest()):
         result = ingester.ingest_session(session)
         if result:
             session_count += 1
             if args.verbose:
                 print(f"  {session.session_id}: {session.total_messages} messages")
 
-    print(f"  Ingested {session_count} sessions")
+    print(f"  Ingested {session_count} sessions (skipped {getattr(claude_parser, 'skipped', 0)} unchanged)")
 
     ingester.close()
     print("\nDone!")
