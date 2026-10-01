@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # Sync local datalake to primary (laptop) database
-# Uses SQLite ATTACH for robust binary-safe merging
+#
+# Default (SYNC_MODE=incremental): export only the rows inserted since the last
+# successful sync (AUTOINCREMENT-id watermark) into a small delta DB, scp it, and
+# merge it on the primary with the same ATTACH/INSERT rules as before. FTS5 stays
+# consistent through the primary's AFTER INSERT triggers. Megabytes per tick.
+# First run / lost watermark: reconcile against the primary's keys (session_ids,
+# message_uuids, newest history timestamp) - exact, a few MB once.
+#
+# SYNC_MODE=full is the old path (VACUUM INTO the whole 23 GB DB + scp it). It halved
+# the star-trek-camera tracker's cycle rate on the desktop for 1.5-2.7 h per tick
+# (star-trek-camera docs/night-1002/datalake-incr-REPORT.md). Manual use only.
+#
+# Env: SYNC_MODE=incremental|full  DRY_RUN=1 (merge rolled back, watermark kept)
+#      SYNC_RECONCILE=1 (ignore the watermark, reconcile against the primary)
 
 set -euo pipefail
 
@@ -50,6 +63,72 @@ sq() {
     sqlite3 -cmd ".timeout 60000" "$@"
 }
 
+SYNC_MODE="${SYNC_MODE:-incremental}"
+DRY_RUN="${DRY_RUN:-0}"
+STATE_DIR="${STATE_DIR:-$HOME/.cache/datalake}"
+DELTA_PY="$PROJECT_ROOT/scripts/sync_delta.py"
+WATERMARK="$STATE_DIR/sync-watermark-$LOCAL_DEVICE.json"
+REMOTE_PY_DB="${REMOTE_DB}"
+mkdir -p "$STATE_DIR"
+
+# Low priority for everything this script runs locally (the camera tracker shares the box)
+lowprio() { nice -n19 ionice -c3 "$@"; }
+
+DELTA_DB="$STATE_DIR/datalake_sync_delta.db"
+KEYS_DB="$STATE_DIR/datalake_sync_keys.db"
+
+incremental_sync() {
+    trap 'rm -f "$DELTA_DB" "$DELTA_DB-journal" "$KEYS_DB"' EXIT
+    local t0 export_json rows dry_flag="" merge_json
+    t0=$(date +%s.%N)
+
+    local export_args=(export --db "$LOCAL_DB" --device "$LOCAL_DEVICE" --out "$DELTA_DB")
+    if [[ -f "$WATERMARK" && "${SYNC_RECONCILE:-0}" != "1" ]]; then
+        log "Watermark: $(cat "$WATERMARK")"
+        export_args+=(--watermark-file "$WATERMARK")
+    else
+        log "No watermark (or SYNC_RECONCILE=1): reconciling against the primary's keys"
+        ssh "$REMOTE_HOST" "mkdir -p ~/.cache/datalake && python3 - keys --db $REMOTE_PY_DB --device $LOCAL_DEVICE --out ~/.cache/datalake/datalake_sync_keys.db" < "$DELTA_PY" | tee -a "$LOG_DIR/sync.log"
+        scp -q -C "$REMOTE_HOST:.cache/datalake/datalake_sync_keys.db" "$KEYS_DB"
+        ssh "$REMOTE_HOST" 'rm -f ~/.cache/datalake/datalake_sync_keys.db'
+        log "Keys fetched ($(du -h "$KEYS_DB" | cut -f1))"
+        export_args+=(--keys "$KEYS_DB")
+    fi
+
+    export_json=$(lowprio python3 "$DELTA_PY" "${export_args[@]}")
+    log "Export: $export_json"
+    rows=$(python3 -c 'import json,sys; print(sum(json.loads(sys.argv[1])["rows"].values()))' "$export_json")
+
+    if [[ "$rows" -gt 0 ]]; then
+        log "Transferring delta ($(du -h "$DELTA_DB" | cut -f1), $rows rows)..."
+        ssh "$REMOTE_HOST" 'mkdir -p ~/.cache/datalake'
+        scp -q -C "$DELTA_DB" "$REMOTE_HOST:.cache/datalake/datalake_sync_delta.db"
+        [[ "$DRY_RUN" == "1" ]] && dry_flag="--dry-run"
+        merge_json=$(ssh "$REMOTE_HOST" "python3 - merge --db $REMOTE_PY_DB --delta ~/.cache/datalake/datalake_sync_delta.db --device $LOCAL_DEVICE $dry_flag; rc=\$?; rm -f ~/.cache/datalake/datalake_sync_delta.db; exit \$rc" < "$DELTA_PY")
+        log "Merge: $merge_json"
+    else
+        log "Nothing new since the watermark; no transfer"
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY_RUN=1: watermark not advanced"
+    else
+        python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["watermark"]))' "$export_json" > "$WATERMARK.tmp"
+        mv "$WATERMARK.tmp" "$WATERMARK"
+        sq "$LOCAL_DB" "
+INSERT INTO sync_log (source_device, target_device, sync_type, records_synced, started_at, completed_at, status, metadata)
+VALUES ('$LOCAL_DEVICE', 'laptop', 'incremental', $rows, datetime($t0, 'unixepoch'), datetime('now'), 'success', '$(echo "$export_json" | tr -d "'")');
+" 2>/dev/null || true
+    fi
+    log "Sync complete! (incremental, $rows rows, $(python3 -c "import time; print(round(time.time()-$t0, 1))") s)"
+}
+
+if [[ "$SYNC_MODE" == "incremental" ]]; then
+    incremental_sync
+    exit 0
+fi
+
+log "SYNC_MODE=$SYNC_MODE: old full path (VACUUM INTO the whole DB + scp)"
 # Count local records to sync
 log "Counting local records..."
 LOCAL_STATS=$(sq "$LOCAL_DB" "
