@@ -66,8 +66,8 @@ def keys(db, device, out):
     conn = _connect(db, readonly=True)
     conn.execute("ATTACH DATABASE ? AS k", (f"file:{out}?mode=rwc",))
     conn.execute("BEGIN")
-    conn.execute("CREATE TABLE k.sessions (session_id TEXT PRIMARY KEY)")
-    conn.execute("CREATE TABLE k.messages (message_uuid TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE k.sessions (session_id TEXT PRIMARY KEY) WITHOUT ROWID")
+    conn.execute("CREATE TABLE k.messages (message_uuid TEXT PRIMARY KEY) WITHOUT ROWID")
     conn.execute("CREATE TABLE k.meta (k TEXT PRIMARY KEY, v)")
     conn.execute("INSERT OR IGNORE INTO k.sessions SELECT session_id FROM claude_sessions WHERE source_device = ?", (device,))
     conn.execute(
