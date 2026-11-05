@@ -10,8 +10,8 @@ artifacts which are synced with my datalake as well."
 Source: ~/.local/state/mpv-history/history.jsonl on each machine (written by the mpv script and by
 media-history-recorder; one start / progress / end line per play, same id). Each run:
   1. copies this machine's file to data/media-history/<host>.jsonl (the datalake keeps its own copy),
-  2. on the primary (laptop) also pulls the other machines' files over ssh (LAN alias first, Tailscale fallback,
-     5 s timeouts, at most every 30 min; skipped quietly when unreachable),
+  2. on the primary (laptop) also pulls the other machines' files over ssh (his order: LAN alias, VPS relay, Tailscale
+     only as the backup; 5 s timeouts, at most every 30 min; skipped quietly when unreachable),
   3. merges the lines of every data/media-history/*.jsonl by (host, id) and UPSERTs them.
 Idempotent. Run by media-history-recorder after every play ends. Table (created here):
   media_plays  one row per play: host, id, player, kind (file|web), path, url, title, artist, duration, position,
@@ -34,7 +34,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HISTORY = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
                        "mpv-history", "history.jsonl")
 COPIES = os.path.join(HERE, "data", "media-history")
-PULL_FROM = [("desktop-lan", "desktop")]       # (LAN alias, Tailscale fallback) per other machine
+# per other machine, in his channel order: home LAN, VPS relay (wg-vdi), Tailscale (backup only)
+PULL_FROM = [("desktop-lan", "desktop-vdi", "desktop")]
 PULL_EVERY = 1800
 COLS = ["host", "id", "player", "kind", "path", "url", "title", "artist", "duration", "position", "start_pos",
         "started", "ended", "reason", "source", "video"]
