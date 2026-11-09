@@ -34,13 +34,13 @@ drives and the desktop HDD did not open. The `/mnt/rpi5/DS9` folder hung Thunar.
 |---|---|---|---|
 | 1 | `/api/photos/full` was built **laptop-only**: it read the zip from `~/Downloads` and returned 503 for anything else ("For Pi5-side zips (9-001/002/003), returns 503 — uses thumb"). 2021-2024 full images never worked on any machine. | 2026-05-15 (`39255f0`) | 6 months |
 | 2 | The Pi unzipped 9-001..003 to `/mnt/nas/elements/google-photos-extracted`. The viewer was never told. | 2026-02-14 | 9 months |
-| 3 | The ssh alias `pi5` pointed at `192.168.29.10`, an address that no longer existed. An agent noticed it was dead (`setup-ssh.sh` comment, `26ca17f`) and **added `pi5-lan` beside it instead of fixing it**. Every datalake Pi feature (status, search, extract) and agent-tracker's fallback kept calling the dead one. | known 2026-07-20 | 4 months |
+| 3 | The ssh alias `pi5` pointed at `192.168.29.10`, an address that no longer existed. embedded-device-bootstrapping CLAUDE.md wrote it down as dead on 2026-04-10. An agent noticed again on 2026-07-20 (`setup-ssh.sh` comment, `26ca17f`) and **added `pi5-lan` beside it instead of fixing it**. Every datalake Pi feature (status, search, extract) and agent-tracker's fallback kept calling the dead one. | dead since 2026-04-10 | 7 months |
 | 4 | The laptop offload moved zips 9-004/9-005 (most of 2025) from `~/Downloads` to the Pi's Elements drive. The viewer's only source vanished. **No one asked "who reads these files?"** before moving them. | 2026-10-02 | 5 weeks |
 | 5 | The T7 SSD's contents moved to the Seagate. `/mnt/nas/t7` became empty, and the datalake's extract endpoint still pointed there. | 2026-11-01 | 1 week |
 | 6 | The 2026-11-06 fix (`b0fca8f`, `6dc50c2`) made **video playback** (mpv-history) go LAN → VPS relay → Tailscale. It was described as solving NAS access. No one listed the other programs that read the NAS, so photos, Thunar and the datalake Pi features stayed broken. | 2026-11-06 | 3 days |
 | 7 | Thunar bookmarks were bare LAN IPs (`sftp://pi@192.168.0.2/...`). They can only work at home. | 2026-10 | until he travelled |
 | 8 | The Pi's Tailscale was logged out. This was written down as "needs his login" on 11-06 but never brought to him as a one-tap action. | ≤ 2026-11-06 | 3+ days |
-| 9 | Found while fixing this: three laptop timers (`local-bootstrapping-sync`, `datalake-refresh`, `datalake-healthcheck`) have been **stuck since 2026-10-06**. systemd shows them "elapsed" with no next run, so they never fire again, and nothing alarmed. | 2026-10-06 | 34 days |
+| 9 | Found by the new activity bar: six laptop user timers (`local-bootstrapping-sync`, `datalake-refresh`, `datalake-healthcheck`, `clipboard-health`, `moonlight-health`, `wallpaper-rotate`) **stuck since 2026-10-06**: "elapsed", no next run, no alarm. Cause: `OnBootSec` in a user manager counts from system boot; his session started ~10 min after boot, so the first run never came and `OnUnitActiveSec` had nothing to count from. | 2026-10-06 | 34 days |
 
 ## Absence of foresight: ours (the agents)
 
@@ -123,13 +123,24 @@ A stalled relay fell through to Tailscale (20 s) and the photo still loaded.
    popped up at the right prompt), not as a line in a doc.
 7. **Remote access never copies his data** onto the laptop by default.
 
+## Done later the same day (his two yeses)
+
+- `local-bootstrapping-sync` and `datalake-healthcheck` run again: `OnActiveSec`
+  replaces `OnBootSec` (local-bootstrapping `6d1d01e`).
+- The Pi is a member of the VPS relay at 10.77.0.4 (vps_bootstrap `41f2b67`,
+  local-bootstrapping `a0c7ec9`), and its Tailscale is logged in again
+  (100.124.200.77, from a terminal popped up over `ssh pi5`). `pi5` now tries the
+  Pi's own relay address first: a fresh ssh takes 0.45 s (was 3.7 s via the
+  desktop), and a 0.55 MB photo 5.5 s (was 8-10 s) on the same hotspot.
+- Speeds are shown in KB/s and MB/s (his "sane" units).
+
 ## Still open (2026-11-09)
 
-- The three stuck laptop timers (row 9). Restarting `datalake-refresh` pulls
-  datalake data from the desktop onto the laptop over the hotspot, so they are
-  waiting for his yes. The activity bar shows them in red until then.
-- The Pi is not a member of the VPS relay. It is reached only through the desktop,
-  or through its own Tailscale once he logs it in (a terminal was popped up for that).
+- `datalake-refresh` stays stuck until he is home: its first run pulls a month of
+  datalake data onto the laptop. Fix it the same way then.
+- `clipboard-health`, `moonlight-health`, `wallpaper-rotate`: same bug, waiting for
+  his word (`wallpaper-rotate` would visibly start changing the wallpaper).
 - `/mnt/rpi5/DS9` (cifs) still hangs when away. The mount fix waits for his call
   (local-bootstrapping `docs/issues/mpv-history-panel-empty-cifs-hang.md`).
-- Pages that do not extend `base.html` do not show the activity bar yet.
+- Pages that do not extend `base.html` (control, memory, memory events) do not
+  show the activity bar yet.

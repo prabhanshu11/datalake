@@ -2374,7 +2374,8 @@ def _home_route(target='pi'):
         return '?'
 
 
-_ROUTE_NAMES = {'lan': 'home LAN', 'vdi': 'VPS relay', 'ts': 'Tailscale (backup)', 'local': 'this laptop'}
+_ROUTE_NAMES = {'lan': 'home LAN', 'vdi': 'VPS relay', 'vdij': 'VPS relay via desktop',
+                'ts': 'Tailscale (backup)', 'tsj': 'Tailscale via desktop (backup)', 'local': 'this laptop'}
 
 
 def _open_photo_stream(member, archive, fit):

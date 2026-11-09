@@ -48,8 +48,9 @@
   const dock = document.getElementById('actDock'), bar = document.getElementById('actBar');
   const IFACE = {wlan0: 'Wi-Fi', 'wg-vdi': 'VPS relay (wg-vdi)', tailscale0: 'Tailscale'};
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  const mbit = bps => { const b = bps * 8; return b >= 1e6 ? (b/1e6).toFixed(1) + ' Mbit/s'
-                         : b >= 1e3 ? Math.round(b/1e3) + ' kbit/s' : Math.round(b) + ' bit/s'; };
+  // Speeds in bytes, like Chrome's downloads and file managers (his 2026-11-09: "sane" units).
+  const mbit = bps => bps >= 1048576 ? (bps/1048576).toFixed(1) + ' MB/s'
+                    : bps >= 1024 ? Math.round(bps/1024) + ' KB/s' : bps > 0 ? '< 1 KB/s' : '0 KB/s';
   const size = n => n >= 1048576 ? (n/1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n/1024)) + ' KB';
   const ago = s => s < 90 ? Math.round(s) + ' s' : s < 5400 ? Math.round(s/60) + ' min'
                  : s < 172800 ? (s/3600).toFixed(1) + ' h' : Math.round(s/86400) + ' days';

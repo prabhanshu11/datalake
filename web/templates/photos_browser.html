@@ -845,7 +845,8 @@
             <img id="modalThumb" src="/static/thumbs/${fid}.jpg" style="filter: blur(0px);">
             <div id="pmodalLoader">loading full size from the NAS…</div>`;
         const baseCap = `${fname} · ${arch}`;
-        const routeName = {local: 'this laptop', lan: 'home LAN', vdi: 'VPS relay', ts: 'Tailscale (backup)'};
+        const routeName = {local: 'this laptop', lan: 'home LAN', vdi: 'VPS relay', vdij: 'VPS relay via desktop',
+                           ts: 'Tailscale (backup)', tsj: 'Tailscale via desktop (backup)'};
         // Original bytes in a new tab (stopPropagation: a click elsewhere closes the modal).
         const origLink = `<a href="/api/photos/full/${fid}" target="_blank" rel="noopener"
             onclick="event.stopPropagation()" style="color:#58a6ff;padding:0.6rem 0.4rem;display:inline-block;">original ↗</a>`;
@@ -870,7 +871,8 @@
             // Read the stream ourselves so the loader shows live bytes and speed.
             const r = resp.headers.get('X-NAS-Route');
             const total = +resp.headers.get('Content-Length') || 0;
-            const fmtSpeed = (b, s) => s > 0 ? ((b * 8) / s / 1e6).toFixed(1) + ' Mbit/s' : '';
+            const fmtSpeed = (b, s) => { if (!(s > 0)) return ''; const v = b / s;
+                return v >= 1048576 ? (v / 1048576).toFixed(1) + ' MB/s' : Math.max(1, Math.round(v / 1024)) + ' KB/s'; };
             const reader = resp.body.getReader();
             const parts = []; let got = 0;
             while (true) {
