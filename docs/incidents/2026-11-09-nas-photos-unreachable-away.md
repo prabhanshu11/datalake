@@ -133,13 +133,13 @@ A stalled relay fell through to Tailscale (20 s) and the photo still loaded.
   Pi's own relay address first: a fresh ssh takes 0.45 s (was 3.7 s via the
   desktop), and a 0.55 MB photo 5.5 s (was 8-10 s) on the same hotspot.
 - Speeds are shown in KB/s and MB/s (his "sane" units).
+- `clipboard-health`, `moonlight-health`, `wallpaper-rotate` fixed the same way after his
+  "ok" (local-bootstrapping `87671f8`); wallpaper rotation resumed 20:28 IST.
 
 ## Still open (2026-11-09)
 
 - `datalake-refresh` stays stuck until he is home: its first run pulls a month of
   datalake data onto the laptop. Fix it the same way then.
-- `clipboard-health`, `moonlight-health`, `wallpaper-rotate`: same bug, waiting for
-  his word (`wallpaper-rotate` would visibly start changing the wallpaper).
 - `/mnt/rpi5/DS9` (cifs) still hangs when away. The mount fix waits for his call
   (local-bootstrapping `docs/issues/mpv-history-panel-empty-cifs-hang.md`).
 - Pages that do not extend `base.html` (control, memory, memory events) do not
