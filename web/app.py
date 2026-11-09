@@ -954,6 +954,9 @@ def check_node_reachable(host: str, timeout: int = 2, use_ssh: bool = False) -> 
     import subprocess
     try:
         if use_ssh:
+            # pi5 may go through the VPS relay or Tailscale (home-routes.conf): a fresh
+            # connection there takes ~4 s, later ones reuse it, so allow PI_SSH_TIMEOUT.
+            timeout = max(timeout, PI_SSH_TIMEOUT)
             result = subprocess.run(
                 ['ssh', '-o', f'ConnectTimeout={timeout}', host, 'true'],
                 capture_output=True, timeout=timeout + 3
@@ -2339,10 +2342,78 @@ def photos_review_rollup():
     return jsonify(roll)
 
 
+# Where takeout photos live on the NAS: one map for every machine,
+# local-bootstrapping dotfiles/network/nas.json "photos". Defaults = 2026-11-09.
+NAS_MAP = Path.home() / 'Programs' / 'local-bootstrapping' / 'dotfiles' / 'network' / 'nas.json'
+_PHOTO_NAS_DEFAULT = {
+    'extracted_root': '/mnt/nas/elements/google-photos-extracted',
+    'archive_dirs': ['/mnt/nas/seagate/ssd-backup-02F7-B67/takeout-archives',
+                     '/mnt/nas/elements/laptop-offload-2026-10-02/Downloads'],
+}
+PI_SSH_TIMEOUT = 8   # first connection over the VPS relay takes ~4 s; later ones reuse it (~0.3 s)
+
+
+def _photo_nas_cfg():
+    try:
+        d = json.loads(NAS_MAP.read_text()).get('photos') or {}
+        return {k: d.get(k) or v for k, v in _PHOTO_NAS_DEFAULT.items()}
+    except Exception:
+        return dict(_PHOTO_NAS_DEFAULT)
+
+
+def _home_route(target='pi'):
+    """The channel ssh uses for pi5 right now (lan | vdi | ts), for the UI."""
+    import subprocess
+    try:
+        return subprocess.run(['home-route', 'pick', target], capture_output=True,
+                              text=True, timeout=10).stdout.strip() or '?'
+    except Exception:
+        return '?'
+
+
+_ROUTE_NAMES = {'lan': 'home LAN', 'vdi': 'VPS relay', 'ts': 'Tailscale (backup)', 'local': 'this laptop'}
+
+
+def _fetch_photo_from_nas(member, archive, fit):
+    """Run web/nas_photo.py on the Pi over `ssh pi5`. Returns (bytes, route, note).
+    Retries once with a fresh route choice when ssh itself fails (exit 255)."""
+    import subprocess, shlex
+    cfg = _photo_nas_cfg()
+    args = json.dumps({'member': member, 'archive': archive, 'fit': fit,
+                       'extracted_root': cfg['extracted_root'],
+                       'archive_dirs': cfg['archive_dirs'],
+                       'source': f'takeout:{archive}:{member}'})
+    script = (Path(__file__).parent / 'nas_photo.py').read_bytes()
+    pi_ssh = NODES['pi-nas']['ssh_alias']
+    last = None
+    for attempt in (1, 2):
+        route = _home_route('pi')
+        proc = subprocess.run(
+            ['ssh', '-o', f'ConnectTimeout={PI_SSH_TIMEOUT}', '-o', 'BatchMode=yes', pi_ssh,
+             'python3 - ' + shlex.quote(args)],
+            input=script, capture_output=True, timeout=90)
+        err = proc.stderr.decode(errors='replace').strip()
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout, route, err
+        last = (proc.returncode, route, err)
+        if proc.returncode != 255:
+            break
+        subprocess.run(['home-route', 'failed', 'pi'], capture_output=True)  # next pick skips this channel
+    raise RuntimeError(json.dumps({'exit': last[0], 'route': last[1], 'detail': last[2][-400:]}))
+
+
 @app.route('/api/photos/full/<int:file_id>')
 def photo_full(file_id):
-    """Stream full-size image straight from its zip archive (laptop-side only).
-    For Pi5-side zips (9-001/002/003), returns 503 — uses thumb."""
+    """One photo at full or screen size, from wherever it lives right now.
+
+    1. a takeout zip on this machine (~/Downloads, the old laptop layout);
+    2. the Pi NAS over `ssh pi5`, which picks his channel itself
+       (home LAN -> VPS relay -> Tailscale): the extracted copy first, then the zip.
+    ?fit=N returns a JPEG at most N px on the long edge (fast over a hotspot);
+    no fit = the original bytes. X-NAS-Route says which channel carried it.
+    Nothing is stored on this machine: bytes pass through memory to the browser (no-store).
+    """
+    import mimetypes, subprocess, zipfile
     db = get_files_db()
     if not db:
         return "no DB", 503
@@ -2351,29 +2422,44 @@ def photo_full(file_id):
     ).fetchone()
     if not row:
         return "not found", 404
-
-    # Resolve archive to local path. Laptop has 9-004/005 in ~/Downloads/.
-    local_zip = Path.home() / 'Downloads' / row['source_archive']
-    if not local_zip.exists():
-        return jsonify({'error': 'archive not on this host', 'archive': row['source_archive']}), 503
-
-    import zipfile, mimetypes
-    ext = (row['extension'] or '').lower()
+    fit = request.args.get('fit', default=0, type=int)
+    fit = max(0, min(fit, 6000))
     mime = mimetypes.guess_type(row['path'])[0] or 'application/octet-stream'
-    if ext in ('.heic', '.heif'):
+    if (row['extension'] or '').lower() in ('.heic', '.heif'):
         mime = 'image/heic'  # browsers won't render but it's accurate
+    # no-store: he cleared the laptop before travelling (2026-11-09 "I purposefully cleared space from
+    # this laptop"); a viewed photo is shown, never written to this disk, not even the browser cache.
+    headers = {'Cache-Control': 'no-store'}
 
-    def gen():
-        with zipfile.ZipFile(local_zip) as z:
-            with z.open(row['path']) as f:
-                while True:
-                    chunk = f.read(64 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
+    local_zip = Path.home() / 'Downloads' / row['source_archive']
+    if local_zip.exists() and not fit:
+        def gen():
+            with zipfile.ZipFile(local_zip) as z:
+                with z.open(row['path']) as f:
+                    while True:
+                        chunk = f.read(64 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+        headers['X-NAS-Route'] = 'local'
+        return Response(gen(), mimetype=mime, headers=headers)
 
-    return Response(gen(), mimetype=mime,
-                    headers={'Cache-Control': 'public, max-age=3600'})
+    try:
+        data, route, note = _fetch_photo_from_nas(row['path'], row['source_archive'], fit)
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'the NAS did not answer within 90 s',
+                        'route': _ROUTE_NAMES.get(_home_route('pi'), '?')}), 504
+    except RuntimeError as e:
+        info = json.loads(str(e))
+        info['error'] = ('could not reach the Pi over ' + _ROUTE_NAMES.get(info['route'], info['route'])
+                         if info['exit'] == 255 else 'the Pi could not read this photo')
+        return jsonify(info), 503
+    if fit and data[:3] == b'\xff\xd8\xff':
+        mime = 'image/jpeg'
+    headers['X-NAS-Route'] = route
+    headers['X-NAS-Read-From'] = next((l.split('=', 1)[1] for l in note.splitlines()
+                                       if l.startswith('read_from=')), '?')
+    return Response(data, mimetype=mime, headers=headers)
 
 
 @app.route('/api/photos/list')
@@ -2938,13 +3024,15 @@ def extract_file():
     if not check_node_reachable(pi_ssh, use_ssh=True):
         return jsonify({'error': 'Pi NAS not reachable'}), 503
 
-    archive_path = f'/mnt/nas/t7/takeout-archives/{archive}'
+    # /mnt/nas/t7 is empty since 2026-11-01; the zips are in nas.json photos.archive_dirs
+    _dirs = _photo_nas_cfg()['archive_dirs']
     extract_dir = '/mnt/nas/prabhanshu-files/extracted'
 
     # Use Python zipfile on Pi NAS to extract single file
     extract_cmd = f"""python3 -c "
 import zipfile, os
-z = zipfile.ZipFile('{archive_path}')
+p = next(d + '/{archive}' for d in {_dirs!r} if os.path.isfile(d + '/{archive}'))
+z = zipfile.ZipFile(p)
 z.extract('{file_path}', '{extract_dir}')
 print('OK')
 " """

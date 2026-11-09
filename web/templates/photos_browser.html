@@ -843,25 +843,41 @@
         const arch = t.dataset.arch;
         modalBody.innerHTML = `
             <img id="modalThumb" src="/static/thumbs/${fid}.jpg" style="filter: blur(0px);">
-            <div id="pmodalLoader">loading full size…</div>`;
-        modalCap.textContent = `${fname} · ${arch} · click to close · Esc to close`;
+            <div id="pmodalLoader">loading full size from the NAS…</div>`;
+        const baseCap = `${fname} · ${arch}`;
+        const routeName = {local: 'this laptop', lan: 'home LAN', vdi: 'VPS relay', ts: 'Tailscale (backup)'};
+        // Original bytes in a new tab (stopPropagation: a click elsewhere closes the modal).
+        const origLink = `<a href="/api/photos/full/${fid}" target="_blank" rel="noopener"
+            onclick="event.stopPropagation()" style="color:#58a6ff;padding:0.6rem 0.4rem;display:inline-block;">original ↗</a>`;
+        modalCap.innerHTML = `${baseCap} · ${origLink} · tap to close · Esc`;
         modal.classList.add('open');
-        // Try to load full image in background, swap when ready
-        const fullImg = new Image();
-        fullImg.onload = () => {
-            const thumb = document.getElementById('modalThumb');
+        // Screen-sized copy from wherever the photo lives (this laptop or the Pi NAS, which
+        // ssh reaches over home LAN -> VPS relay -> Tailscale); the thumb stays until it lands.
+        const fit = Math.min(3000, Math.round(Math.max(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1)));
+        const t0 = performance.now();
+        fetch(`/api/photos/full/${fid}?fit=${fit}`).then(async resp => {
             const loader = document.getElementById('pmodalLoader');
-            if (thumb) thumb.src = fullImg.src;
-            if (loader) loader.remove();
-        };
-        fullImg.onerror = () => {
-            const loader = document.getElementById('pmodalLoader');
-            if (loader) {
-                loader.style.color = '#8b949e';
-                loader.textContent = 'full image not available on this host';
+            if (!resp.ok) {
+                let info = {};
+                try { info = await resp.json(); } catch (e) {}
+                if (loader) {
+                    loader.style.color = '#d29922';
+                    loader.textContent = `full size not loaded: ${info.error || resp.status}` +
+                        (info.detail ? ` (${info.detail.split('\n').pop()})` : '') + ' · showing the thumbnail';
+                }
+                return;
             }
-        };
-        fullImg.src = `/api/photos/full/${fid}`;
+            const blob = await resp.blob();
+            const thumb = document.getElementById('modalThumb');
+            if (thumb) thumb.src = URL.createObjectURL(blob);
+            if (loader) loader.remove();
+            const r = resp.headers.get('X-NAS-Route');
+            const secs = ((performance.now() - t0) / 1000).toFixed(1);
+            modalCap.innerHTML = `${baseCap} · via ${routeName[r] || r || '?'} in ${secs} s · ${origLink} · tap to close · Esc`;
+        }).catch(err => {
+            const loader = document.getElementById('pmodalLoader');
+            if (loader) { loader.style.color = '#d29922'; loader.textContent = `full size not loaded: ${err} · showing the thumbnail`; }
+        });
     }
     modal.addEventListener('click', ev => {
         // Don't close when clicking image itself? — Picasa-style click-anywhere closes.
