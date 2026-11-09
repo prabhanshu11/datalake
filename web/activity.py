@@ -206,9 +206,22 @@ def _ts(v):
         return None
 
 
+def _timer_table():
+    """next/last run (epoch s) per timer from `systemctl --user list-timers -o json`: the
+    only place systemd gives the next run of a count-based (OnUnitActiveSec) timer as a time."""
+    import json
+    try:
+        r = subprocess.run(['systemctl', '--user', 'list-timers', '--all', '-o', 'json'],
+                           capture_output=True, text=True, timeout=5)
+        return {t['unit'].removesuffix('.timer'): t for t in json.loads(r.stdout)}
+    except Exception:
+        return {}
+
+
 def sync_units():
     if time.time() - _UNIT_CACHE['t'] < 10:
         return _UNIT_CACHE['data']
+    timers = _timer_table()
     units = list(SYNC_UNITS)
     try:   # any other active user service whose name says it syncs/moves data
         r = subprocess.run(['systemctl', '--user', 'list-units', '--type=service', '--state=active,activating',
@@ -241,12 +254,12 @@ def sync_units():
             'last_start': _ts(s.get('ExecMainStartTimestamp')),
             'last_end': _ts(s.get('ExecMainExitTimestamp')),
             'timer': (tm.get('ActiveState') if has_timer else None),
-            'next_run': _ts(tm.get('NextElapseUSecRealtime')) if has_timer else None,
+            'next_run': ((timers.get(unit, {}).get('next') or 0) // 1_000_000 or None) if has_timer else None,
             'last_trigger': _ts(tm.get('LastTriggerUSec')) if has_timer else None,
             # "elapsed" with no next run = the timer will never fire again on its own
             # (found 2026-11-09: three laptop sync timers stuck like this since 2026-10-06).
             'stuck': bool(has_timer and tm.get('ActiveState') == 'active'
-                          and tm.get('SubState') == 'elapsed' and not tm.get('NextElapseUSecRealtime')),
+                          and tm.get('SubState') == 'elapsed' and not timers.get(unit, {}).get('next')),
         })
     _UNIT_CACHE.update(t=time.time(), data=out)
     return out
