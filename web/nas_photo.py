@@ -15,7 +15,8 @@ args (one JSON object): {"member": str, "archive": str, "fit": int|0,
                          "source": str}
 fit > 0 -> a JPEG whose long edge is at most `fit` px (EXIF orientation applied,
 provenance in EXIF per ~/Programs/CLAUDE.md); fit == 0 -> the original bytes.
-Exit 0 with the bytes on stdout; exit 3 with a one-line reason on stderr.
+Exit 0 with stdout = one line "NASPHOTO {read_from, size, fitted}" + the bytes;
+exit 3 with a one-line reason on stderr.
 """
 import io
 import json
@@ -77,12 +78,17 @@ def fitted(data, a, where):
 def main():
     a = json.loads(sys.argv[1])
     data, where = read_original(a)
+    fit_done = False
     if a.get("fit"):
         try:
             data = fitted(data, a, where)
+            fit_done = True
         except Exception as e:  # HEIC/RAW Pillow cannot open: send the original
             sys.stderr.write("fit skipped (%s), sending original\n" % e.__class__.__name__)
-    sys.stderr.write("read_from=%s\n" % where)
+    # One header line first, so the laptop knows the size (live progress + speed in
+    # the UI) and where the bytes came from, then the bytes.
+    head = {"read_from": where, "size": len(data), "fitted": fit_done}
+    sys.stdout.buffer.write(("NASPHOTO " + json.dumps(head) + "\n").encode())
     sys.stdout.buffer.write(data)
 
 

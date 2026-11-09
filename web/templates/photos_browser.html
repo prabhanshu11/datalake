@@ -867,13 +867,27 @@
                 }
                 return;
             }
-            const blob = await resp.blob();
+            // Read the stream ourselves so the loader shows live bytes and speed.
+            const r = resp.headers.get('X-NAS-Route');
+            const total = +resp.headers.get('Content-Length') || 0;
+            const fmtSpeed = (b, s) => s > 0 ? ((b * 8) / s / 1e6).toFixed(1) + ' Mbit/s' : '';
+            const reader = resp.body.getReader();
+            const parts = []; let got = 0;
+            while (true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+                parts.push(value); got += value.length;
+                const s = (performance.now() - t0) / 1000;
+                if (loader && loader.isConnected) loader.textContent =
+                    `from the NAS via ${routeName[r] || r}: ${Math.round(got / 1024)}` +
+                    (total ? ` of ${Math.round(total / 1024)} KB` : ' KB') + ` · ${fmtSpeed(got, s)}`;
+            }
+            const blob = new Blob(parts, {type: resp.headers.get('Content-Type') || 'image/jpeg'});
             const thumb = document.getElementById('modalThumb');
             if (thumb) thumb.src = URL.createObjectURL(blob);
             if (loader) loader.remove();
-            const r = resp.headers.get('X-NAS-Route');
-            const secs = ((performance.now() - t0) / 1000).toFixed(1);
-            modalCap.innerHTML = `${baseCap} · via ${routeName[r] || r || '?'} in ${secs} s · ${origLink} · tap to close · Esc`;
+            const secs = (performance.now() - t0) / 1000;
+            modalCap.innerHTML = `${baseCap} · via ${routeName[r] || r || '?'}: ${Math.round(got / 1024)} KB in ${secs.toFixed(1)} s (${fmtSpeed(got, secs)}) · ${origLink} · tap to close · Esc`;
         }).catch(err => {
             const loader = document.getElementById('pmodalLoader');
             if (loader) { loader.style.color = '#d29922'; loader.textContent = `full size not loaded: ${err} · showing the thumbnail`; }

@@ -17,6 +17,9 @@ from flask import Flask, render_template, request, jsonify, g, Response
 from pathlib import Path
 from flask import send_from_directory
 from search.es_client import DatalakeSearch
+import threading
+from web import activity
+activity.ensure_sampler()   # link speeds are ready before the first page asks
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB for ChatGPT zips
@@ -2374,9 +2377,14 @@ def _home_route(target='pi'):
 _ROUTE_NAMES = {'lan': 'home LAN', 'vdi': 'VPS relay', 'ts': 'Tailscale (backup)', 'local': 'this laptop'}
 
 
-def _fetch_photo_from_nas(member, archive, fit):
-    """Run web/nas_photo.py on the Pi over `ssh pi5`. Returns (bytes, route, note).
-    Retries once with a fresh route choice when ssh itself fails (exit 255)."""
+def _open_photo_stream(member, archive, fit):
+    """Start web/nas_photo.py on the Pi over `ssh pi5` and read its header line.
+
+    Returns (proc, head, route): head = {read_from, size, fitted}; the photo bytes
+    follow on proc.stdout. Retries once on the next channel when ssh itself fails
+    (exit 255: `home-route failed pi` skips the stalled channel). A watchdog kills
+    a transfer that is still running after 90 s.
+    """
     import subprocess, shlex
     cfg = _photo_nas_cfg()
     args = json.dumps({'member': member, 'archive': archive, 'fit': fit,
@@ -2388,13 +2396,18 @@ def _fetch_photo_from_nas(member, archive, fit):
     last = None
     for attempt in (1, 2):
         route = _home_route('pi')
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ['ssh', '-o', f'ConnectTimeout={PI_SSH_TIMEOUT}', '-o', 'BatchMode=yes', pi_ssh,
              'python3 - ' + shlex.quote(args)],
-            input=script, capture_output=True, timeout=90)
-        err = proc.stderr.decode(errors='replace').strip()
-        if proc.returncode == 0 and proc.stdout:
-            return proc.stdout, route, err
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        threading.Timer(90, lambda p=proc: p.poll() is None and p.kill()).start()
+        proc.stdin.write(script)
+        proc.stdin.close()
+        line = proc.stdout.readline()
+        if line.startswith(b'NASPHOTO '):
+            return proc, json.loads(line[9:]), route
+        proc.wait()
+        err = proc.stderr.read().decode(errors='replace').strip()
         last = (proc.returncode, route, err)
         if proc.returncode != 255:
             break
@@ -2411,14 +2424,15 @@ def photo_full(file_id):
        (home LAN -> VPS relay -> Tailscale): the extracted copy first, then the zip.
     ?fit=N returns a JPEG at most N px on the long edge (fast over a hotspot);
     no fit = the original bytes. X-NAS-Route says which channel carried it.
-    Nothing is stored on this machine: bytes pass through memory to the browser (no-store).
+    Nothing is stored on this machine: bytes stream through to the browser (no-store),
+    counted live in web/activity.py (the speed shown in the activity dock).
     """
-    import mimetypes, subprocess, zipfile
+    import mimetypes, zipfile
     db = get_files_db()
     if not db:
         return "no DB", 503
     row = db.execute(
-        "SELECT path, source_archive, extension FROM files WHERE id = ?", (file_id,)
+        "SELECT path, filename, source_archive, extension FROM files WHERE id = ?", (file_id,)
     ).fetchone()
     if not row:
         return "not found", 404
@@ -2430,6 +2444,7 @@ def photo_full(file_id):
     # no-store: he cleared the laptop before travelling (2026-11-09 "I purposefully cleared space from
     # this laptop"); a viewed photo is shown, never written to this disk, not even the browser cache.
     headers = {'Cache-Control': 'no-store'}
+    label = f"photo {row['filename']}" + (f" ({fit}px)" if fit else " (original)")
 
     local_zip = Path.home() / 'Downloads' / row['source_archive']
     if local_zip.exists() and not fit:
@@ -2444,22 +2459,52 @@ def photo_full(file_id):
         headers['X-NAS-Route'] = 'local'
         return Response(gen(), mimetype=mime, headers=headers)
 
+    op = activity.start('nas-photo', label, 'down', route='connecting…')
     try:
-        data, route, note = _fetch_photo_from_nas(row['path'], row['source_archive'], fit)
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'the NAS did not answer within 90 s',
-                        'route': _ROUTE_NAMES.get(_home_route('pi'), '?')}), 504
+        proc, head, route = _open_photo_stream(row['path'], row['source_archive'], fit)
     except RuntimeError as e:
         info = json.loads(str(e))
         info['error'] = ('could not reach the Pi over ' + _ROUTE_NAMES.get(info['route'], info['route'])
                          if info['exit'] == 255 else 'the Pi could not read this photo')
+        op.route = info['route']
+        op.finish(False, info['error'])
         return jsonify(info), 503
-    if fit and data[:3] == b'\xff\xd8\xff':
+    op.route, op.total = route, head['size']
+    if head.get('fitted'):
         mime = 'image/jpeg'
-    headers['X-NAS-Route'] = route
-    headers['X-NAS-Read-From'] = next((l.split('=', 1)[1] for l in note.splitlines()
-                                       if l.startswith('read_from=')), '?')
-    return Response(data, mimetype=mime, headers=headers)
+    headers.update({'X-NAS-Route': route, 'X-NAS-Read-From': head.get('read_from', '?'),
+                    'Content-Length': str(head['size']),
+                    'Access-Control-Expose-Headers': 'X-NAS-Route, X-NAS-Read-From'})
+
+    def stream():
+        ok = False
+        try:
+            while True:
+                chunk = proc.stdout.read1(64 * 1024)
+                if not chunk:
+                    break
+                op.add(len(chunk))
+                yield chunk
+            ok = proc.wait(timeout=10) == 0 and op.bytes == head['size']
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            op.finish(ok, '' if ok else f'stopped at {op.bytes} of {head["size"]} bytes')
+    return Response(stream(), mimetype=mime, headers=headers)
+
+
+_ROUTE_CACHE = {'t': 0, 'v': '?'}
+
+
+@app.route('/api/activity')
+def api_activity():
+    """Transfers, link speeds and sync jobs right now (web/activity.py); polled by the dock."""
+    snap = activity.snapshot()
+    if time.time() - _ROUTE_CACHE['t'] > 15:          # home-route caches 60 s itself; this
+        _ROUTE_CACHE.update(t=time.time(), v=_home_route('pi'))  # keeps the 2 s poll cheap
+    snap['route_pi'] = _ROUTE_CACHE['v']
+    snap['route_names'] = _ROUTE_NAMES
+    return jsonify(snap)
 
 
 @app.route('/api/photos/list')

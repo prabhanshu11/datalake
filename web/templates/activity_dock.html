@@ -1,0 +1,135 @@
+<!-- Activity dock: upload/download speed, transfers and sync jobs, live, on every page.
+     His words 2026-11-09: "display upload/dowload speed from now on, whene operations happen...
+     and any info about any sync operatiosn that are happening." Data: /api/activity (web/activity.py).
+     Touch: the bar and every button are >= 44 px; tap the bar to open/close the panel. -->
+<style>
+#actDock { position: fixed; right: 12px; bottom: 12px; z-index: 900; font-size: 0.82rem;
+           color: #c9d1d9; max-width: min(560px, calc(100vw - 24px)); }
+#actBar { display: flex; align-items: center; gap: 0.6rem; min-height: 44px; padding: 0 0.9rem;
+          background: #161b22; border: 1px solid #30363d; border-radius: 22px; cursor: pointer;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.45); user-select: none; white-space: nowrap; overflow: hidden; }
+#actBar.busy { border-color: #1f6feb; }
+#actBar .dn { color: #3fb950; } #actBar .up { color: #d29922; }
+#actBar .sep { color: #484f58; }
+#actPanel { display: none; margin-bottom: 8px; max-height: 62vh; overflow-y: auto; background: #161b22;
+            border: 1px solid #30363d; border-radius: 10px; padding: 0.6rem 0.8rem 0.8rem;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
+#actDock.open #actPanel { display: block; }
+#actPanel h4 { margin: 0.7rem 0 0.3rem; font-size: 0.75rem; color: #8b949e; text-transform: uppercase;
+               letter-spacing: 0.04em; font-weight: 600; }
+#actPanel .row { display: flex; justify-content: space-between; gap: 0.8rem; padding: 0.3rem 0;
+                 border-bottom: 1px solid #21262d; }
+#actPanel .row:last-child { border-bottom: none; }
+#actPanel .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+#actPanel .val { white-space: nowrap; font-variant-numeric: tabular-nums; color: #8b949e; }
+#actPanel .sub { font-size: 0.72rem; color: #8b949e; }
+#actPanel .bad { color: #f85149; } #actPanel .ok { color: #3fb950; } #actPanel .run { color: #58a6ff; }
+#actPanel .bar { height: 4px; background: #21262d; border-radius: 2px; margin-top: 3px; }
+#actPanel .bar i { display: block; height: 4px; background: #1f6feb; border-radius: 2px; }
+#actPanel .empty { color: #484f58; font-style: italic; padding: 0.2rem 0; }
+#actClose { float: right; min-width: 44px; min-height: 44px; margin: -0.4rem -0.5rem 0 0; background: none;
+            border: none; color: #8b949e; font-size: 1.2rem; cursor: pointer; }
+</style>
+<div id="actDock">
+  <div id="actPanel">
+    <button id="actClose" title="close" aria-label="close activity panel">✕</button>
+    <h4 style="margin-top:0.2rem">Network now</h4><div id="actLinks"></div>
+    <h4>Transfers now</h4><div id="actActive"></div>
+    <h4>Recent transfers</h4><div id="actRecent"></div>
+    <h4>Sync jobs</h4><div id="actSync"></div>
+    <h4>Other programs moving files</h4><div id="actProcs"></div>
+  </div>
+  <div id="actBar" role="button" aria-label="network and sync activity, tap for details">
+    <span>activity…</span>
+  </div>
+</div>
+<script>
+(function () {
+  const dock = document.getElementById('actDock'), bar = document.getElementById('actBar');
+  const IFACE = {wlan0: 'Wi-Fi', 'wg-vdi': 'VPS relay (wg-vdi)', tailscale0: 'Tailscale'};
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const mbit = bps => { const b = bps * 8; return b >= 1e6 ? (b/1e6).toFixed(1) + ' Mbit/s'
+                         : b >= 1e3 ? Math.round(b/1e3) + ' kbit/s' : Math.round(b) + ' bit/s'; };
+  const size = n => n >= 1048576 ? (n/1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n/1024)) + ' KB';
+  const ago = s => s < 90 ? Math.round(s) + ' s' : s < 5400 ? Math.round(s/60) + ' min'
+                 : s < 172800 ? (s/3600).toFixed(1) + ' h' : Math.round(s/86400) + ' days';
+  const when = (t, now) => !t ? '—' : t > now ? 'in ' + ago(t - now) : ago(now - t) + ' ago';
+  let routeNames = {};
+  const rname = r => routeNames[r] || r || '?';
+  bar.addEventListener('click', () => { dock.classList.toggle('open'); tick(); });
+  document.getElementById('actClose').addEventListener('click', e => { e.stopPropagation(); dock.classList.remove('open'); });
+
+  function render(d) {
+    routeNames = d.route_names || {};
+    const links = Object.entries(d.links || {});
+    const main = links.filter(([n]) => !(n in IFACE) || n === 'wlan0');
+    const rx = main.reduce((a, [, v]) => a + v.rx_bps, 0), tx = main.reduce((a, [, v]) => a + v.tx_bps, 0);
+    const running = (d.sync_units || []).filter(u => u.running);
+    const failed = (d.sync_units || []).filter(u => u.stuck || (!u.running && u.result && u.result !== 'success'));
+    const act = d.active || [];
+    bar.classList.toggle('busy', act.length > 0 || running.length > 0);
+    let h = `<span class="dn">↓ ${mbit(rx)}</span><span class="up">↑ ${mbit(tx)}</span><span class="sep">·</span>`;
+    if (act.length) {
+      const a = act[0];
+      h += `<span>${esc(a.label.slice(0, 28))} ${a.total ? Math.round(100 * a.bytes / a.total) + '%' : size(a.bytes)}`
+         + ` · ${mbit(a.bps)} · ${esc(rname(a.route))}</span>`;
+    } else {
+      h += `<span>NAS via ${esc(rname(d.route_pi))}</span>`;
+    }
+    const syncTxt = [running.length ? running.length + ' sync running' : '',
+                     failed.length ? '<span style="color:#f85149">' + failed.length + ' sync stuck/failed</span>' : '']
+                    .filter(Boolean).join(' · ') || 'sync idle';
+    h += `<span class="sep">·</span><span>${syncTxt}</span>`;
+    bar.innerHTML = h;
+    if (!dock.classList.contains('open')) return;
+    const now = d.now;
+    document.getElementById('actLinks').innerHTML = links.length ? links.map(([n, v]) =>
+      `<div class="row"><span class="lbl">${esc(IFACE[n] || n)}</span>
+       <span class="val"><span class="ok">↓ ${mbit(v.rx_bps)}</span> &nbsp; ↑ ${mbit(v.tx_bps)}</span></div>`).join('')
+      + `<div class="sub">The Pi NAS is reached via <b>${esc(rname(d.route_pi))}</b> right now (order: home LAN → VPS relay → Tailscale).</div>`
+      : '<div class="empty">no network links</div>';
+    document.getElementById('actActive').innerHTML = act.length ? act.map(a =>
+      `<div class="row" style="display:block"><div style="display:flex;justify-content:space-between;gap:.8rem">
+         <span class="lbl run">${esc(a.label)}</span>
+         <span class="val">${size(a.bytes)}${a.total ? ' of ' + size(a.total) : ''} · ${mbit(a.bps)}</span></div>
+       <div class="sub">${a.direction === 'up' ? 'upload' : 'download'} via ${esc(rname(a.route))} · ${a.seconds} s</div>
+       ${a.total ? `<div class="bar"><i style="width:${Math.min(100, 100 * a.bytes / a.total)}%"></i></div>` : ''}</div>`).join('')
+      : '<div class="empty">nothing transferring</div>';
+    document.getElementById('actRecent').innerHTML = (d.recent || []).length ? d.recent.map(a =>
+      `<div class="row"><span class="lbl ${a.ok ? '' : 'bad'}">${a.ok ? '' : '✗ '}${esc(a.label)}</span>
+       <span class="val">${size(a.bytes)} in ${a.seconds} s · ${mbit(a.bps)} · ${esc(rname(a.route))} · ${ago(a.ended_ago)} ago</span></div>`
+      + (a.ok ? '' : `<div class="sub bad">${esc(a.note)}</div>`)).join('')
+      : '<div class="empty">none since the app started</div>';
+    document.getElementById('actSync').innerHTML = (d.sync_units || []).length ? d.sync_units.map(u => {
+      const st = u.running ? '<span class="run">running</span>'
+               : u.stuck ? '<span class="bad">stuck</span>'
+               : u.result && u.result !== 'success' ? `<span class="bad">last run failed (${esc(u.result)}, exit ${esc(u.exit_status)})</span>`
+               : u.last_end ? '<span class="ok">ok</span>' : u.last_trigger ? 'idle' : 'never ran';
+      const sched = u.timer == null ? 'no timer'
+                  : u.stuck ? `<span class="bad">STUCK: timer will not fire again (last fired ${when(u.last_trigger, now)})</span>`
+                  : u.timer !== 'active' ? `<span class="bad">timer ${esc(u.timer)}: will not run</span>`
+                  : 'next ' + when(u.next_run, now);
+      return `<div class="row" style="display:block"><div style="display:flex;justify-content:space-between;gap:.8rem">
+                <span class="lbl">${esc(u.unit)}</span><span class="val">${st}</span></div>
+              <div class="sub">${esc(u.what)} · last ${u.running ? 'started ' + when(u.last_start, now) : when(u.last_end || u.last_start || u.last_trigger, now)} · ${sched}</div></div>`;
+    }).join('') : '<div class="empty">no sync jobs found</div>';
+    document.getElementById('actProcs').innerHTML = (d.processes || []).length ? d.processes.map(p =>
+      `<div class="row"><span class="lbl">${esc(p.comm)} <span class="sub">${esc(p.args)}</span></span>
+       <span class="val">read ${mbit(p.read_bps)} · write ${mbit(p.write_bps)} · ${ago(p.seconds)}</span></div>`).join('')
+      : '<div class="empty">none</div>';
+  }
+
+  let timer = null, inflight = false;
+  async function tick() {
+    if (inflight || document.hidden) return;
+    inflight = true;
+    try { const r = await fetch('/api/activity'); if (r.ok) render(await r.json()); }
+    catch (e) { bar.innerHTML = '<span style="color:#f85149">activity: datalake not answering</span>'; }
+    finally { inflight = false; }
+  }
+  function startPoll() { if (!timer) { tick(); timer = setInterval(tick, 2000); } }
+  function stopPoll() { clearInterval(timer); timer = null; }
+  document.addEventListener('visibilitychange', () => document.hidden ? stopPoll() : startPoll());
+  startPoll();
+})();
+</script>
